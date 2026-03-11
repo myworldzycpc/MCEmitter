@@ -3,19 +3,32 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
 import copy
-from typing import Optional, List, Tuple, Dict, Any, Type, Generic, TypeVar, Union
+from typing import Optional, List, Tuple, Dict, Any, Type, Generic, TypeVar, Union, override, overload
+
+T = TypeVar('T')
+K = TypeVar('K')
+TCreatable = TypeVar('TCreatable', bound="Creatable")
 
 
 # ==============================
 # 工具类（通用功能抽离）
 # ==============================
+class Creatable(ABC):
+    """创建接口"""
+
+    @abstractmethod
+    def create_command(self) -> "Command":
+        """创建命令"""
+        pass
+
+
 class Argument(ABC):
     def __init__(self, dynamic: bool = False):
         self.is_dynamic = dynamic
 
 
 class DynamicString(Argument):
-    def __init__(self, *symbols: Union[str, MacroArgument]):
+    def __init__(self, *symbols: Union[str, "MacroArgument"]):
         super().__init__(dynamic=True)
         self.symbols = symbols
 
@@ -26,21 +39,36 @@ class DynamicString(Argument):
 class Namespace:
     """命名空间基类"""
 
-    def __init__(self, namespace: str):
-        self.namespace = namespace
+    def __init__(self, name: str):
+        self.name = name
         Registries.NAMESPACE_REGISTRY.register_argument(self)
 
     def __str__(self) -> str:
-        return self.namespace
+        return self.name
 
     def __repr__(self) -> str:
-        return f"Namespace('{self.namespace}')"
+        return f"Namespace('{self.name}')"
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, Namespace) and self.name == other.name
+
+    def namespaced_id(self, id: Union[str, DynamicString]):
+        return NamespacedId(self, id)
+
+    def path_namespace_id(self, path: Tuple[str | DynamicString, ...]):
+        return PathNamespacedId(self, path)
+
+    def function(self, path: tuple[str], commands: Optional[List[Command]] = None, limit_entities=None):
+        return Function(self.path_namespace_id(path), commands=commands, limit_entities=limit_entities)
 
 
 class NamespacedId(Argument):
@@ -64,7 +92,7 @@ class NamespacedId(Argument):
         return cls(Config.MINECRAFT_NAMESPACE, id)
 
     @classmethod
-    def parse_full_id(cls, full_id: str) -> NamespacedId:
+    def parse_full_id(cls, full_id: str) -> "NamespacedId":
         """解析完整ID为命名空间和ID部分"""
         parts = full_id.split(":", 1)
         if len(parts) != 2:
@@ -77,21 +105,33 @@ class NamespacedId(Argument):
     def __repr__(self) -> str:
         return f"NamespacedId({self.namespace}, {self.id})"
 
+    def __hash__(self):
+        return hash(str(self))
+
+    def __eq__(self, other):
+        return isinstance(other, NamespacedId) and str(self) == str(other)
+
 
 class PathNamespacedId(NamespacedId):
     """路径式命名空间ID处理类，负责路径式命名空间ID的生成和解析"""
 
     def __init__(self, namespace: Namespace, path: Tuple[str | DynamicString, ...]):
         super().__init__(namespace, '/'.join(map(str, path)))
+        self.path = path or ()
         if any(isinstance(part, DynamicString) for part in path):
             self.is_dynamic = True
 
+    def __add__(self, other: Tuple[Union[str, DynamicString], ...]):
+        return PathNamespacedId(self.namespace, self.path + other)
+
+    def parent(self) -> "PathNamespacedId":
+        """获取父级路径式命名空间ID"""
+        return PathNamespacedId(self.namespace, self.path[:-1])
+
 
 # ==============================
-# 注册表管理（单一职责）
+# 注册表管理
 # ==============================
-T = TypeVar('T')
-K = TypeVar('K')
 
 
 class Registry(Generic[K, T]):
@@ -119,7 +159,7 @@ class Registry(Generic[K, T]):
         return list(self._items.values())
 
 
-class FunctionRegistry(Registry[Tuple[str, ...], 'Function']):
+class FunctionRegistry(Registry[PathNamespacedId, 'Function']):
     """函数注册表，专门负责Function实例的管理"""
 
     def __init__(self):
@@ -128,7 +168,7 @@ class FunctionRegistry(Registry[Tuple[str, ...], 'Function']):
 
     def register_function(self, function: "Function") -> None:
         """注册函数实例"""
-        self.register(function.path, function)
+        self.register(function.namespaced_id, function)
 
     def get_auto_id(self, path: Tuple[str, ...]) -> int:
         """生成匿名函数ID"""
@@ -139,7 +179,7 @@ class FunctionRegistry(Registry[Tuple[str, ...], 'Function']):
         """打印所有注册的函数"""
         print("Registered functions:")
         for func in self.get_all():
-            print(f"\n{"/".join(func.path)}{" (macro)" if func.is_macro else ""}:")
+            print(f"\n{func.namespaced_id}{" (macro)" if func.is_macro else ""}:")
             for cmd in func.commands:
                 print(f"  {cmd}")
 
@@ -147,7 +187,7 @@ class FunctionRegistry(Registry[Tuple[str, ...], 'Function']):
         """保存所有注册的函数"""
         os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
         for func in self.get_all():
-            file_path = os.path.join(Config.OUTPUT_DIR, "/".join(func.path) + ".mcfunction")
+            file_path = os.path.join(Config.OUTPUT_DIR, "data", func.namespaced_id.namespace.name, "function", "/".join(map(str, func.namespaced_id.path)) + ".mcfunction")
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 for cmd in func.commands:
@@ -162,7 +202,7 @@ class ObjectiveRegistry(Registry[str, 'Objective']):
 
     def register_objective(self, objective: "Objective") -> None:
         """注册计分板目标实例"""
-        self.register(objective.objective, objective)
+        self.register(objective.name, objective)
 
 
 class ArgumentType(Enum):
@@ -197,7 +237,7 @@ class NamespaceRegistry(Registry[str, Namespace]):
 
     def register_argument(self, namespace: "Namespace"):
         """注册参数实例"""
-        self.register(namespace.namespace, namespace)
+        self.register(namespace.name, namespace)
 
 
 class Registries:
@@ -224,21 +264,6 @@ class Storage(NamespacedId):
     pass
 
 
-# 预定义的方块和物品类型
-PREDEFINED_BLOCK_TYPES: Dict[str, BlockType] = {
-    "air": BlockType.with_minecraft_namespace("air"),
-    "stone": BlockType.with_minecraft_namespace("stone"),
-    "dirt": BlockType.with_minecraft_namespace("dirt"),
-    "grass_block": BlockType.with_minecraft_namespace("grass_block"),
-}
-
-PREDEFINED_ITEM_TYPES: Dict[str, ItemType] = {
-    "stone_sword": ItemType.with_minecraft_namespace("stone_sword"),
-    "stone_pickaxe": ItemType.with_minecraft_namespace("stone_pickaxe"),
-    "stone_axe": ItemType.with_minecraft_namespace("stone_axe"),
-}
-
-
 class DataPointer(Argument):
     """数据指针基类"""
 
@@ -258,32 +283,10 @@ class StorageDataPointer(DataPointer):
         return f"{self.storage} {self.path}"
 
 
-class SubFunctionArgument(Argument):
-    """子函数参数"""
-
-    def __init__(self, path: Tuple[str, ...], commands: Optional[List["Command"]] = None):
-        super().__init__()
-        self.path = path
-        self.commands: List["Command"] = commands or []
-
-    def get(self, parent_path: Tuple[str, ...]) -> "Function":
-        """基于父路径创建子函数"""
-        full_path = parent_path + self.path
-        return Function(path=full_path, commands=self.commands)
-
-    def __str__(self) -> str:
-        """生成子函数的字符串表示"""
-        temp_path = ("temp",) + self.path
-        temp_func = Function(path=temp_path)
-        func_str = str(temp_func)
-        Registries.FUNCTION_REGISTRY.remove(temp_path)  # 清理临时函数
-        return func_str
-
-
 class Command:
     """命令类，负责构建和表示单个命令"""
 
-    def __init__(self, parts: Optional[List[Any]] = None):
+    def __init__(self, *parts: Union[str, Argument]):
         self.parts: List[Any] = []
         self.is_dynamic: bool = False
         if parts:
@@ -305,23 +308,19 @@ class Command:
         return f"Command(parts={self.parts})"
 
 
-class ObjectiveCommand(Command):
-    """计分板目标命令"""
-
-    def __init__(self, objective: "Objective", parts: Optional[List[Any]] = None):
-        super().__init__(parts)
-        self.objective: Objective = objective
-
-
 class Function(Argument):
     """函数类，负责管理一组命令"""
 
-    def __init__(self, path: Optional[Tuple[str, ...]] = None, commands: Optional[List[Command]] = None, limit_entities=None):
+    def __init__(self, namespaced_id: PathNamespacedId, commands: Optional[List[Command]] = None, limit_entities=None):
+        if namespaced_id.is_dynamic:
+            raise ValueError("Dynamic namespaced ID is not allowed for function")
         super().__init__()
-        self.path: Tuple[str, ...] = path or ()
-        self.namespaced_id: PathNamespacedId = PathNamespacedId(self.path)
+        self.namespaced_id: PathNamespacedId = namespaced_id
         self.is_macro: bool = False
         self.commands: List[Command] = []
+        self.limit_entities = limit_entities
+        self.opened = False
+        self.modified_macro_arguments: set[MacroArgument] = set()
 
         # 当前命令上下文参数
         self.context_stack: List[str] = []
@@ -337,20 +336,18 @@ class Function(Argument):
 
     def _process_command_parts(self, command: Command) -> Command:
         """处理命令中的子函数参数"""
-        processed_parts = []
-        for part in command.parts:
-            if isinstance(part, SubFunctionArgument):
-                processed_parts.append(part.get(self.path))
-            else:
-                processed_parts.append(part)
-        command.parts = processed_parts
+        # processed_parts = []
+        # for part in command.parts:
+        #     processed_parts.append(part)
+        # command.parts = processed_parts
         return command
 
     def add_command(self, command: Command) -> None:
         """添加单个命令"""
         if not isinstance(command, Command):
             raise TypeError(f"Expected Command instance, got {type(command).__name__}")
-
+        if not self.opened:
+            raise ValueError("Cannot add command to closed function")
         processed_command = self._process_command_parts(command)
         self.commands.append(processed_command)
 
@@ -362,25 +359,27 @@ class Function(Argument):
         for cmd in commands:
             self.add_command(cmd)
 
-    def create_child(self, child_path: str) -> "Function":
+    def create_child(self, *child_path: str, commands=None, limit_entities=None) -> "Function":
         """创建子函数"""
-        if not isinstance(child_path, str):
-            raise TypeError(f"Expected string for child path, got {type(child_path).__name__}")
-        full_path = self.path + (child_path,)
-        return Function(path=full_path)
+        for part in child_path:
+            if not isinstance(part, str):
+                raise TypeError(f"Expected string for child path, got {type(child_path).__name__}")
+        full_path = self.namespaced_id + child_path
+        return Function(namespaced_id=full_path, commands=commands, limit_entities=limit_entities)
 
     def __str__(self) -> str:
         """转换为函数字符串"""
         if self.is_macro:
-            return f"{self.namespaced_id} with storage {Config.DEFAULT_NAMESPACE}:{Config.ARGUMENT_STORAGE}"
+            return f"{self.namespaced_id} with storage {Config.ARGUMENT_STORAGE}"
         else:
             return f"{self.namespaced_id}"
 
     def __enter__(self):
+        self.opened = True
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+        self.opened = False
 
     def _ensure_execute_context(self) -> None:
         """确保处于execute上下文中"""
@@ -398,7 +397,7 @@ class Function(Argument):
         for part in full_parts:
             if isinstance(part, Argument) and part.is_dynamic:
                 self.is_dynamic = True
-        command = Command(full_parts)
+        command = Command(*full_parts)
         command.is_dynamic = self.is_dynamic
         self.context_stack = []  # 重置上下文栈
         self.is_dynamic = False  # 重置动态参数标志
@@ -409,18 +408,9 @@ class Function(Argument):
         """创建say命令"""
         return self._finalize_command(["say"] + list(args))
 
-    def objective(self, objective: str | Objective, criteria: ScoreboardCriteria = None) -> ObjectiveCommand:
-        if criteria is None:
-            criteria = ScoreboardCriteria.dummy()
-        """创建scoreboard objective add命令"""
-        if isinstance(objective, str):
-            objective_obj = Objective(objective)
-        elif isinstance(objective, Objective):
-            objective_obj = objective
-        else:
-            raise TypeError(f"Expected string or Objective for objective, got {type(objective).__name__}")
-        command = self._finalize_command(["scoreboard", "objectives", "add", objective_obj, criteria])
-        return ObjectiveCommand(objective_obj, command.parts)
+    def create(self, obj: TCreatable) -> 'TCreatable':
+        self._finalize_command(obj.create_command().parts)
+        return obj
 
     def set(self, target, value):
         match target:
@@ -430,10 +420,11 @@ class Function(Argument):
                 else:
                     raise TypeError(f"Expected int for score value, got {type(value).__name__}")
             case MacroArgument() as arg:
+                self.modified_macro_arguments.add(arg)
                 match arg.type:
                     case ArgumentType.INTEGER:
                         if isinstance(value, int):
-                            return self._finalize_command(["data", "modify", "storage", StorageDataPointer(Storage.with_default_namespace(Config.ARGUMENT_STORAGE), arg.name), "set", "value", value])
+                            return self._finalize_command(["data", "modify", "storage", StorageDataPointer(Config.ARGUMENT_STORAGE, arg.name), "set", "value", value])
                         else:
                             raise TypeError(f"Expected int for macro argument {arg.name}, got {type(value).__name__}")
                     case _:
@@ -441,20 +432,13 @@ class Function(Argument):
             case _:
                 raise NotImplementedError("Unsupported target for set command")
 
-    def call_function(self, function: Function | PathNamespacedId) -> Command:
+    def call_function(self, function: Union["Function", PathNamespacedId]) -> Command:
         """创建调用函数的命令"""
         return self._finalize_command(["function", function])
 
-    def sub_function(self, path: str | Tuple[str, ...], commands: Optional[List[Command]] = None) -> Function:
+    def sub_function(self, *path: str, commands: Optional[List[Command]] = None, limit_entities=None) -> "Function":
         """创建子函数调用命令"""
-        if isinstance(path, str):
-            path_tuple = (path,)
-        elif isinstance(path, tuple):
-            path_tuple = path
-        else:
-            raise TypeError(f"Path must be string or tuple, got {type(path).__name__}")
-
-        function = self.create_child(path)
+        function = self.create_child(*path, commands=commands, limit_entities=limit_entities)
         self._finalize_command(["function", function])
         return function
 
@@ -561,9 +545,10 @@ class Selector:
         return f"Selector({self.var.name})"
 
 
-class ScoreboardCriteria:
+class ScoreboardCriteria(Argument):
 
     def __init__(self, value: str):
+        super().__init__()
         self.value = value
 
     @classmethod
@@ -574,9 +559,10 @@ class ScoreboardCriteria:
         return self.value
 
 
-class Objective:
-    def __init__(self, objective: str):
-        self.objective = objective
+class Objective(Creatable):
+    def __init__(self, objective: str, criteria: "ScoreboardCriteria" = None):
+        self.name = objective
+        self.criteria = criteria or ScoreboardCriteria.dummy()
 
         Registries.OBJECTIVE_REGISTRY.register_objective(self)
 
@@ -587,7 +573,11 @@ class Objective:
         return self[Selector.self()]
 
     def __str__(self):
-        return self.objective
+        return self.name
+
+    def create_command(self) -> "Command":
+        """创建scoreboard objective add命令"""
+        return Command("scoreboard", "objectives", "add", self.name, self.criteria)
 
 
 class Score:
@@ -629,14 +619,34 @@ class MacroArgument(Argument):
     def __str__(self) -> str:
         return f"$({self.name})"
 
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, MacroArgument) and self.name == other.name
+
 
 class Config:
     DEFAULT_NAMESPACE: Namespace = Namespace("my_namespace")
     MINECRAFT_NAMESPACE: Namespace = Namespace("minecraft")
     FUNCTION_REGISTRY_CLEANUP_ON_EXIT: bool = True
-    ARGUMENT_STORAGE: Storage = Storage.with_default_namespace("args")
-    OUTPUT_DIR: str = f"output/data/{DEFAULT_NAMESPACE}/function"
+    ARGUMENT_STORAGE: Storage = Storage(DEFAULT_NAMESPACE, "args")
+    OUTPUT_DIR: str = "output/"
 
+
+# 预定义的方块和物品类型
+PREDEFINED_BLOCK_TYPES: Dict[str, BlockType] = {
+    "air": BlockType.with_minecraft_namespace("air"),
+    "stone": BlockType.with_minecraft_namespace("stone"),
+    "dirt": BlockType.with_minecraft_namespace("dirt"),
+    "grass_block": BlockType.with_minecraft_namespace("grass_block"),
+}
+
+PREDEFINED_ITEM_TYPES: Dict[str, ItemType] = {
+    "stone_sword": ItemType.with_minecraft_namespace("stone_sword"),
+    "stone_pickaxe": ItemType.with_minecraft_namespace("stone_pickaxe"),
+    "stone_axe": ItemType.with_minecraft_namespace("stone_axe"),
+}
 
 # ==============================
 # 示例使用
@@ -650,20 +660,31 @@ if __name__ == "__main__":
     macro_i = MacroArgument("i", ArgumentType.INTEGER)
 
     # 创建函数
-    with Function(("my_function",)) as main:
-        main.say("Hello, world!", Selector.self()),
-        main.objective(my_objective),
-        with main.as_and_at(Selector.all()).sub_function("child_function") as child:
-            child.say("Child function", Selector.self()),
-            child.say("2"),
-            child.comment("This is a comment"),
-            child.say("3"),
-            child.set(my_objective.self(), 10),
-        main.set(my_int, 5),
-        with main.if_(my_objective.self(), '<=', 100).sub_function("if_block") as if_block:
-            if_block.say("Score is greater than or equal to 10"),
-            if_block.store(my_objective["test"]).random(Range(1, my_int)),
-            if_block.call_function(PathNamespacedId(("my_function", DynamicString("function", macro_i))))
+    with Config.DEFAULT_NAMESPACE as namespace:
+        with namespace.function(("my_function",)) as main:
+            main.say("Hello, world!", Selector.self())
+            main.create(my_objective)
+            with main.as_and_at(Selector.all()).sub_function("child_function") as child:
+                child.say("Child function", Selector.self())
+                child.say("2")
+                child.comment("This is a comment")
+                child.say("3")
+                child.set(my_objective.self(), 10)
+            main.set(my_int, 5)
+            with main.if_(my_objective.self(), '<=', 100).sub_function("if_block") as if_block:
+                if_block.say("Score is greater than or equal to 10")
+                if_block.store(my_objective["test"]).random(Range(1, my_int))
+                if_block.call_function(namespace.path_namespace_id(("my_function", DynamicString("function", macro_i))))
+
+    with Namespace("other_namespace") as other_namespace:
+        with other_namespace.function(("other_function",)) as other:
+            other.say("Other function", Selector.self())
+            with other.sub_function("other") as other:
+                other.say("Other function 2", Selector.self())
+                with other.sub_function("other") as other:
+                    other.say("Other function 3", Selector.self())
+            #     other.say("Other function 2")  # ValueError: Cannot add command to closed function
+            # other.say("Other function 1")
 
     Registries.FUNCTION_REGISTRY.print_registered_functions()
     Registries.FUNCTION_REGISTRY.save_registered_functions()
