@@ -4,4 +4,7 @@
     <option name="sdkName" value="Python 3.14 (MCEmitter)" />
   </component>
   <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.14 (MCEmitter)" project-jdk-type="Python SDK" />
+  <component name="PyrightConfiguration">
+    <option name="enabled" value="true" />
+  </component>
 </project>

@@ -1,0 +1,5 @@
+[tool.basedpyright]
+
+# 将“未使用的调用结果”警告关闭
+reportUnusedCallResult = "none"
+#reportAny = "none"
