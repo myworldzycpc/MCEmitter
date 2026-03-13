@@ -1,29 +1,35 @@
 from __future__ import annotations
 
 import os
+import typing
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Sequence
 from enum import Enum
+from functools import singledispatch
 from string.templatelib import Template, Interpolation
 from types import TracebackType
 from typing import Self, Generic, TypeVar, override, overload, Literal
 
-from nbtlib import Base, Int, Numeric
+import nbtlib
 
 T = TypeVar('T')
+TCovariant = TypeVar('TCovariant', covariant=True)
+T2 = TypeVar('T2')
 K = TypeVar('K')
 TCreatable = TypeVar('TCreatable', bound="Creatable")
-TArgument = TypeVar('TArgument', bound="Argument")
-TBase = TypeVar('TBase', bound=Base)
-TBaseCovariant = TypeVar('TBaseCovariant', bound=Base, covariant=True)
+TBaseCovariant = TypeVar('TBaseCovariant', bound="Base[object]", covariant=True)
+TBase = TypeVar('TBase', bound="Base[object]")
 
-type CommandPartCompatible = str | Argument | int | float | bool
+type CommandPartCompatible = str | Argument[object] | int | float | bool
+type MaybeMacro[T] = T | MacroArgument[T]
+type MaybeMacroInt = int | MaybeMacro[Int]
+type CompOp = Literal['=', '>=', '<=', '>', '<']
 
 
 # ==============================
 # 工具类（通用功能抽离）
 # ==============================
+
 class Creatable(ABC):
     """创建接口"""
 
@@ -33,30 +39,63 @@ class Creatable(ABC):
         pass
 
 
-class Argument(ABC):
+class Argument(Generic[TCovariant], ABC):
 
     def __init__(self, dynamic: bool = False):
         self.is_dynamic: bool = dynamic
 
 
-class StringArgument(Argument):
+class Base(Argument["Base[TCovariant]"], Generic[TCovariant], ABC):
+    """一切能序列化为NBT的"""
     pass
 
 
-class DynamicString(StringArgument):
-    symbols: tuple[str | MacroArgument[Base], ...]
+class Numeric(Base[T2], Generic[T2, T], ABC):
+    def __init__(self, value: T):
+        super().__init__()
+        self.value: T = value
 
-    def __init__(self, *symbols: str | MacroArgument[Base]):
+    @property
+    @abstractmethod
+    def suffix(self) -> str:
+        pass
+
+    @override
+    def __str__(self):
+        return f"{self.value}{self.suffix}"
+
+
+class Int(Numeric["Int", int]):
+    @property
+    @override
+    def suffix(self) -> str:
+        return ""
+
+
+class String(Base["String"]):
+    def __init__(self, value: str = "", dynamic: bool = False):
+        super().__init__(dynamic=dynamic)
+        self.value: str = value
+
+    @override
+    def __str__(self):
+        return self.value
+
+
+class DynamicString(String):
+    symbols: tuple[str | MacroArgument[Base[object]], ...]
+
+    def __init__(self, *symbols: str | MacroArgument[Base[object]]):
         super().__init__(dynamic=True)
         self.symbols = symbols
 
     @classmethod
     def t(cls, t_string: Template):
         """从模板字符串创建动态字符串"""
-        symbols: list[str | MacroArgument[Base]] = []
+        symbols: list[str | MacroArgument[Base[object]]] = []
         for part in t_string:
             if isinstance(part, Interpolation) and isinstance(part.value, MacroArgument):
-                symbols.append(part.value)
+                symbols.append(typing.cast(MacroArgument[Base[object]], part.value))
             elif isinstance(part, str):
                 symbols.append(part)
             else:
@@ -108,7 +147,7 @@ class Namespace:
         return Function(self.path_namespace_id(path), commands=commands, limit_entities=limit_entities)
 
 
-class NamespacedId(StringArgument):
+class NamespacedId(String):
     """命名空间ID处理类，负责所有命名空间相关的字符串生成和解析"""
     dynamic: bool
     id: str | DynamicString
@@ -252,13 +291,13 @@ class ObjectiveRegistry(Registry[str, 'Objective']):
         self.register(objective.name, objective)
 
 
-class MacroArgumentRegistry(Registry[str, "MacroArgument[Base]"]):
+class MacroArgumentRegistry(Registry[str, "MacroArgument[object]"]):
     """参数注册表，专门负责命令存储args的管理"""
 
     def __init__(self):
         super().__init__("Macro Argument")
 
-    def register_argument(self, macro_argument: MacroArgument[Base]):
+    def register_argument(self, macro_argument: MacroArgument[object]):
         """注册参数实例"""
         self.register(macro_argument.name, macro_argument)
 
@@ -294,24 +333,50 @@ class ItemType(NamespacedId):
     pass
 
 
-class Storage(NamespacedId):
-    pass
+class Path(String, nbtlib.Path):
+    @override
+    def __str__(self):
+        return nbtlib.Path.__str__(self)
 
 
-class DataPointer(Argument):
+class DataHolder(ABC):
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        pass
+
+    @abstractmethod
+    def full_parts(self) -> list[CommandPartCompatible]:
+        pass
+
+
+class Storage(NamespacedId, DataHolder):
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return [self]
+
+    @override
+    def full_parts(self) -> list[CommandPartCompatible]:
+        return ["storage", self]
+
+
+class DataPointer(String, Generic[TBaseCovariant], ABC):
     """数据指针基类"""
-    path: str
+    path: Path
 
-    def __init__(self, path: str):
+    def __init__(self, path: Path):
         super().__init__()
         self.path = path
 
+    @abstractmethod
+    def full_parts(self) -> list[CommandPartCompatible]:
+        pass
 
-class StorageDataPointer(DataPointer):
+
+class StorageDataPointer(DataPointer[TBaseCovariant], Generic[TBaseCovariant]):
     """存储数据指针"""
     storage: Storage
 
-    def __init__(self, storage: Storage, path: str):
+    def __init__(self, storage: Storage, path: Path):
         super().__init__(path)
         self.storage = storage
 
@@ -319,32 +384,351 @@ class StorageDataPointer(DataPointer):
     def __str__(self) -> str:
         return f"{self.storage} {self.path}"
 
+    @override
+    def full_parts(self) -> list[CommandPartCompatible]:
+        return self.storage.full_parts() + [self.path]
 
-class Command:
-    """命令类，负责构建和表示单个命令"""
 
-    def __init__(self, *parts: CommandPartCompatible):
-        self.parts: list[CommandPartCompatible] = []
-        self.is_dynamic: bool = False
-        if parts:
-            for part in parts:
-                self.add_part(part)
+class CommandBase(ABC):
+    def __init__(self):
+        pass
 
-    def add_part(self, part: CommandPartCompatible) -> "Command":
-        """添加命令部分，并检测是否为动态参数"""
-        self.parts.append(part)
-        if isinstance(part, Argument) and part.is_dynamic:
-            self.is_dynamic = True
-        return self
+    @property
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        pass
+
+    @property
+    def is_dynamic(self) -> bool:
+        1
+        for part in self.parts:
+            if isinstance(part, Argument) and part.is_dynamic:
+                return True
+        return False
 
     @override
     def __str__(self) -> str:
         """转换为命令字符串"""
-        return ("$" if self.is_dynamic else "") + " ".join(str(part) for part in self.parts)
+        return " ".join(str(part) for part in self.parts)
 
     @override
     def __repr__(self) -> str:
-        return f"Command(parts={self.parts})"
+        return f"{type(self).__name__}(parts={self.parts})"
+
+
+class Command(CommandBase, ABC):
+    """命令类，负责构建和表示单个命令"""
+
+    @override
+    def __str__(self) -> str:
+        """转换为命令字符串"""
+        return ("$" if self.is_dynamic else "") + super().__str__()
+
+
+class CommentCommand(Command):
+    args: tuple[CommandPartCompatible, ...]
+
+    def __init__(self, *args: CommandPartCompatible):
+        super().__init__()
+        self.args = args
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["#"] + list(self.args)
+
+
+class SayCommand(Command):
+    """say命令"""
+    args: tuple[CommandPartCompatible, ...]
+
+    def __init__(self, *args: CommandPartCompatible):
+        super().__init__()
+        self.args = args
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["say"] + list(self.args)
+
+
+class ExecuteSubCommand(CommandBase, ABC):
+    pass
+
+
+class ExecuteAsSubCommand(ExecuteSubCommand):
+    """execute as子命令"""
+    selector: Selector
+
+    def __init__(self, selector: Selector):
+        super().__init__()
+        self.selector = selector
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["as", self.selector]
+
+
+class ExecuteAtSubCommand(ExecuteSubCommand):
+    """execute at子命令"""
+    selector: Selector
+
+    def __init__(self, selector: Selector):
+        super().__init__()
+        self.selector = selector
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["at", self.selector]
+
+
+class ExecuteIfSubCommand(ExecuteSubCommand, ABC):
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["if"]
+
+
+class ExecuteIfScoreSubCommand(ExecuteIfSubCommand, ABC):
+    score: Score
+
+    def __init__(self, score: Score):
+        super().__init__()
+        self.score = score
+
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["score", self.score]
+
+
+class ExecuteIfScoreMatchesSubCommand(ExecuteIfScoreSubCommand):
+    range: IntRange | MaybeMacroInt
+
+    def __init__(self, score: Score, range: IntRange | MaybeMacroInt):
+        super().__init__(score)
+        self.range = range
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["matches", self.range]
+
+
+class ExecuteIfScoreOpSubCommand(ExecuteIfScoreSubCommand):
+    op: CompOp
+    score2: Score
+
+    def __init__(self, score: Score, op: CompOp, score2: Score):
+        super().__init__(score)
+        self.op = op
+        self.score2 = score2
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + [self.op, self.score2]
+
+
+class ExecuteStoreSubCommand(ExecuteSubCommand):
+    type: Literal["result", "success"]
+    target: DataPointer[Base[object]] | Score
+
+    def __init__(self, type: Literal["result", "success"], pointer: DataPointer[Base[object]] | Score):
+        super().__init__()
+        self.type = type
+        self.target = pointer
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        if isinstance(self.target, DataPointer):
+            return ["store", self.type] + self.target.full_parts()
+        else:
+            return ["store", self.type, "score", self.target]
+
+
+class ExecuteCommand(Command):
+    run: Command
+    sub_commands: list[ExecuteSubCommand]
+
+    def __init__(self, sub_commands: list[ExecuteSubCommand], run: Command):
+        super().__init__()
+        if isinstance(run, CommentCommand):
+            raise ValueError("Cannot add comment inside execute context")
+        self.sub_commands = sub_commands
+        self.run = run
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["execute"] + [part for sub_command in self.sub_commands for part in sub_command.parts] + ["run"] + self.run.parts
+
+
+class RandomCommand(Command, ABC):
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["random"]
+
+
+class RandomRangeCommand(RandomCommand, ABC):
+    range: IntRange
+    mode: Literal["value", "roll"]
+    sequence: None  # TODO: 序列参数
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + [self.mode, self.range]
+
+
+class RandomValueCommand(RandomRangeCommand):
+    """random value命令"""
+    range: IntRange
+    mode: Literal["value", "roll"] = "value"
+
+    def __init__(self, range: IntRange):
+        super().__init__()
+        self.range = range
+
+
+class RandomRollCommand(RandomRangeCommand):
+    """random value命令"""
+    range: IntRange
+    mode: Literal["value", "roll"] = "roll"
+
+    def __init__(self, range: IntRange):
+        super().__init__()
+        self.range = range
+
+
+class ScoreboardCommand(Command, ABC):
+
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["scoreboard"]
+
+
+class ScoreboardObjectivesCommand(ScoreboardCommand, ABC):
+    """scoreboard objectives命令"""
+
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["objectives"]
+
+
+class ScoreboardObjectivesAddCommand(ScoreboardObjectivesCommand):
+    objective: Objective
+
+    def __init__(self, objective: Objective):
+        super().__init__()
+        self.objective = objective
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["add", self.objective, self.objective.criteria]
+
+
+class ScoreboardPlayersCommand(ScoreboardCommand, ABC):
+    """scoreboard players命令"""
+
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["players"]
+
+
+class ScoreboardPlayersSetCommand(ScoreboardPlayersCommand):
+    score: Score
+    value: MaybeMacroInt
+
+    def __init__(self, score: Score, value: MaybeMacroInt):
+        super().__init__()
+        self.score = score
+        self.value = value
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["set", self.score, self.value]
+
+
+class DataCommand(Command, ABC):
+
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["data"]
+
+
+class DataModifyCommand(DataCommand, Generic[TBaseCovariant], ABC):
+
+    def __init__(self, data_pointer: DataPointer[TBaseCovariant]):
+        super().__init__()
+        self.data_pointer: DataPointer[TBaseCovariant] = data_pointer
+
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["modify"] + self.data_pointer.full_parts()
+
+
+class DataModifySetCommand(DataModifyCommand[TBaseCovariant], Generic[TBaseCovariant], ABC):
+    """data modify ... set命令"""
+
+    @property
+    @override
+    @abstractmethod
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["set"]
+
+
+class DataModifySetValueCommand(DataModifySetCommand[TBaseCovariant], Generic[TBaseCovariant]):
+    value: Base[TBaseCovariant]
+
+    def __init__(self, data_pointer: DataPointer[TBaseCovariant], value: Base[TBaseCovariant]):
+        super().__init__(data_pointer)
+        self.value = value
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["value", self.value]
+
+
+class FunctionCommand(Command):
+    with_: DataPointer[Base[object]] | DataHolder | None | Literal["auto"]
+    function: Function
+
+    def __init__(self, function: Function, with_: DataPointer[Base[object]] | DataHolder | None | Literal["auto"] = "auto"):
+        super().__init__()
+        self.function = function
+        self.with_ = with_
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        with_: DataPointer[Base[object]] | DataHolder | None = None
+        if self.with_ == "auto":
+            if self.function.is_macro:
+                with_ = Config.ARGUMENT_STORAGE
+        else:
+            with_ = self.with_
+        return list(["function", self.function] + (["with"] + with_.full_parts() if with_ is not None else []))
 
 
 class Function(PathNamespacedId):
@@ -352,45 +736,36 @@ class Function(PathNamespacedId):
     opened: bool
     limit_entities: None
 
-    def __init__(self, namespaced_id: PathNamespacedId, commands: list[Command] | None = None, limit_entities: None = None):
-        if namespaced_id.is_dynamic:
+    def __init__(self, namespaced_id: PathNamespacedId, commands: list[Command] | None = None, limit_entities: None = None, virtual: bool = False):
+        if not virtual and namespaced_id.is_dynamic:
             raise ValueError("Dynamic namespaced ID is not allowed for function")
         super().__init__(namespaced_id.namespace, namespaced_id.path)
         self.is_macro: bool = False
         self.commands: list[Command] = []
         self.limit_entities = limit_entities  # TODO: 限制实体参数
         self.opened = False
-        self.modified_macro_arguments: set[MacroArgument[Base]] = set()
+        self.modified_macro_arguments: set[MacroArgument[object]] = set()
         self.create_from: Function | None = None
+        self.virtual: bool = virtual
 
         # 当前命令上下文参数
-        self.context_stack: list[CommandPartCompatible] = []
-        self.in_execute: bool = False
-        self.is_dynamic: bool = False
+        self.context_stack: list[ExecuteSubCommand] = []
 
         # 注册函数
-        Registries.FUNCTION_REGISTRY.register_function(self)
+        if not self.virtual:
+            Registries.FUNCTION_REGISTRY.register_function(self)
 
         # 添加并处理命令
         if commands:
             self.add_commands(commands)
 
-    def _process_command_parts(self, command: Command) -> Command:
-        """处理命令中的子函数参数"""
-        # processed_parts = []
-        # for part in command.parts:
-        #     processed_parts.append(part)
-        # command.parts = processed_parts
-        return command
-
     def add_command(self, command: Command) -> None:
         """添加单个命令"""
         if not self.opened:
             raise ValueError("Cannot add command to closed function")
-        processed_command = self._process_command_parts(command)
-        self.commands.append(processed_command)
+        self.commands.append(command)
 
-        if processed_command.is_dynamic:
+        if command.is_dynamic:
             self.is_macro = True
 
     def add_commands(self, commands: list[Command]) -> None:
@@ -412,68 +787,44 @@ class Function(PathNamespacedId):
         if self.create_from:
             self.create_from.call_function(self)
 
-    def _ensure_execute_context(self) -> None:
-        """确保处于execute上下文中"""
-        if not self.in_execute:
-            self.context_stack.append("execute")
-            self.in_execute = True
-
-    def _finalize_command(self, command_parts: Sequence[CommandPartCompatible]) -> Command:
+    def _finalize_command(self, command: Command) -> Command:
         """最终化命令，处理execute上下文"""
-        if self.in_execute:
-            self.context_stack.append("run")
-            self.in_execute = False
-        self.context_stack.extend(command_parts)
-        full_parts = self.context_stack
-        for part in full_parts:
-            if isinstance(part, Argument) and part.is_dynamic:
-                self.is_dynamic = True
-        command = Command(*full_parts)
-        command.is_dynamic = self.is_dynamic
+        if len(self.context_stack) > 0:
+            command = ExecuteCommand(self.context_stack, command)
         self.context_stack = []  # 重置上下文栈
-        self.is_dynamic = False  # 重置动态参数标志
         self.add_command(command)
         return command
 
     def say(self, *args: CommandPartCompatible) -> Command:
         """创建say命令"""
-        return self._finalize_command(["say"] + list(args))
+        return self._finalize_command(SayCommand(*args))
 
     def create(self, obj: TCreatable) -> 'TCreatable':
-        self._finalize_command(obj.create_command().parts)
+        self._finalize_command(obj.create_command())
         return obj
 
     @overload
-    def set(self, target: Score, value: int) -> Command:
+    def set(self, target: Score, value: int, /) -> Command:
         ...
 
     @overload
-    def set(self, target: MacroArgument[TBase], value: TBase) -> Command:
+    def set(self, target: MacroArgument[TBase], value: Base[TBase], /) -> Command:
         ...
 
-    def set(self, target: Score | MacroArgument[TBase], value: int | TBase):
-        match target:
-            case Score() as score:
-                if isinstance(value, int):
-                    return self._finalize_command(["scoreboard", "players", "set", score, value])
-                else:
-                    raise TypeError(f"Expected int for score value, got {type(value).__name__}")
-            case MacroArgument() as arg:
-                self.modified_macro_arguments.add(arg)
-                if isinstance(value, int):
-                    return self._finalize_command(["data", "modify", "storage", StorageDataPointer(Config.ARGUMENT_STORAGE, arg.name), "set", "value", value])
-                else:
-                    raise TypeError(f"Expected int for macro argument {arg.name}, got {type(value).__name__}")
+    @singledispatch
+    def set(self, target: Score | MacroArgument[TBase], value: int | Base[TBase]) -> Command:
+        match target, value:
+            case Score(), int():
+                return self._finalize_command(ScoreboardPlayersSetCommand(target, value))
+            case MacroArgument(), Base():
+                self.modified_macro_arguments.add(target)
+                return self._finalize_command(DataModifySetValueCommand(StorageDataPointer[TBase](Config.ARGUMENT_STORAGE, Path(target.name)), value))
+            case _:
+                raise ValueError(f"Invalid target or value: {target}, {value}")
 
-    def call_function(self, function: Function | PathNamespacedId, macro: bool | None = None) -> Command:
+    def call_function(self, function: Function, with_: DataPointer[Base[object]] | DataHolder | None | Literal["auto"] = "auto") -> Command:
         """创建调用函数的命令"""
-        with_storage = False
-        if macro is not None:
-            with_storage = macro
-        else:
-            if isinstance(function, Function):
-                with_storage = function.is_macro
-        return self._finalize_command(["function", function] + (["with", "storage", Config.ARGUMENT_STORAGE] if with_storage else []))
+        return self._finalize_command(FunctionCommand(function, with_))
 
     def sub_function(self, *path: str, commands: list[Command] | None = None, limit_entities: None = None) -> "Function":
         """创建子函数调用命令"""
@@ -481,40 +832,37 @@ class Function(PathNamespacedId):
         function.create_from = self
         return function
 
-    def random(self, range: IntRange) -> Command:
+    def random_value(self, range: IntRange) -> Command:
         """创建random子命令"""
-        return self._finalize_command(["random", range])
+        return self._finalize_command(RandomValueCommand(range))
 
     def comment(self, *args: CommandPartCompatible) -> Command:
         """创建注释命令"""
-        if self.context_stack:
-            raise ValueError("Cannot add comment inside execute context")
-        return self._finalize_command(["#"] + list(args))
+        return self._finalize_command(CommentCommand(*args))
 
-    def _add_execute_modifier(self, modifier: str, *args: CommandPartCompatible) -> "Function":
+    def _add_execute_sub_command(self, sub_command: ExecuteSubCommand) -> "Function":
         """通用的execute修饰符添加方法（复用代码）"""
-        self._ensure_execute_context()
-        self.context_stack.extend([modifier, *args])
+        self.context_stack.append(sub_command)
         return self
 
     def as_(self, selector: Selector) -> "Function":
         """添加as修饰符"""
-        return self._add_execute_modifier("as", selector)
+        return self._add_execute_sub_command(ExecuteAsSubCommand(selector))
 
     def at(self, selector: Selector) -> "Function":
         """添加at修饰符"""
-        return self._add_execute_modifier("at", selector)
+        return self._add_execute_sub_command(ExecuteAtSubCommand(selector))
 
     def as_and_at(self, selector: Selector) -> "Function":
         """同时添加as和at修饰符（替代原ast方法，更易理解）"""
         return self.as_(selector).at(Selector.self())
 
     @overload
-    def if_(self, score: Score, operator: Literal['=', '>=', '<=', '>', '<'], value: int, /) -> "Function":
+    def if_(self, score: Score, operator: CompOp, value: MaybeMacroInt, /) -> "Function":
         ...
 
     @overload
-    def if_(self, score: Score, value: int, /) -> "Function":
+    def if_(self, score: Score, value: MaybeMacroInt, /) -> "Function":
         ...
 
     @overload
@@ -522,41 +870,52 @@ class Function(PathNamespacedId):
         ...
 
     @overload
-    def if_(self, score: Score, start: int, end: int, /) -> "Function":
+    def if_(self, score: Score, start: MaybeMacroInt, end: MaybeMacroInt, /) -> "Function":
         ...
 
-    def if_(self, *args: object):
+    def if_(self, *args: object) -> "Function":
         match args:
+            case (Score() as score, str(operator), MacroArgument() as value):
+                value = typing.cast(MacroArgument[Int], value)
+                match operator:
+                    case '=':
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value))
+                    case '>=':
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None)))
+                    case '<=':
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value)))
+                    case _:
+                        raise ValueError(f"Invalid operator: {operator}")
             case (Score() as score, str(operator), int(value)):
                 match operator:
                     case '=':
-                        return self._add_execute_modifier("if", "score", score, "matches", value)
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value))
                     case '>=':
-                        return self._add_execute_modifier("if", "score", score, "matches", IntRange(value, None))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None)))
                     case '<=':
-                        return self._add_execute_modifier("if", "score", score, "matches", IntRange(None, value))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value)))
                     case '>':
-                        return self._add_execute_modifier("if", "score", score, "matches", IntRange(value + 1, None))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value + 1, None)))
                     case '<':
-                        return self._add_execute_modifier("if", "score", score, "matches", IntRange(None, value - 1))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value - 1)))
                     case _:
                         raise ValueError(f"Invalid operator: {operator}")
             case (Score() as score, int(value)):
-                return self._add_execute_modifier("if", "score", score, "matches", value)
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value))
             case (Score() as score, IntRange() as range):
-                return self._add_execute_modifier("if", "score", score, "matches", range)
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, range))
             case (Score() as score, int(start), int(end)):
-                return self._add_execute_modifier("if", "score", score, "matches", IntRange(start, end))
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(start, end)))
             case _:
                 raise ValueError(f"Invalid arguments: {args}")
 
-    def store(self, target: Score | DataPointer | MacroArgument[Base]):
+    def store(self, type: Literal["result", "success"], target: Score | DataPointer[Base[object]] | MacroArgument[Base[object]]):
         """添加store子命令"""
         match target:
-            case Score() as score:
-                return self._add_execute_modifier("store", "score", score)
-            case StorageDataPointer() as pointer:
-                return self._add_execute_modifier("store", "storage", pointer)
+            case Score():
+                return self._add_execute_sub_command(ExecuteStoreSubCommand(type, target))
+            case StorageDataPointer():
+                return self._add_execute_sub_command(ExecuteStoreSubCommand(type, target))
             case _:
                 raise NotImplementedError("Unsupported target for store command")
 
@@ -571,7 +930,7 @@ class SelectorVariable(Enum):
     RANDOM = "r"
 
 
-class Selector(Argument):
+class Selector(String):
     """命令选择器"""
 
     def __init__(self, var: SelectorVariable):
@@ -603,7 +962,7 @@ class Selector(Argument):
         return f"Selector({self.var.name})"
 
 
-class ScoreboardCriteria(Argument):
+class ScoreboardCriteria(String):
     value: str
 
     def __init__(self, value: str):
@@ -619,11 +978,12 @@ class ScoreboardCriteria(Argument):
         return self.value
 
 
-class Objective(Creatable):
+class Objective(String, Creatable):
     criteria: ScoreboardCriteria
     name: str
 
     def __init__(self, objective: str, criteria: ScoreboardCriteria | None = None):
+        super().__init__()
         self.name = objective
         self.criteria = criteria or ScoreboardCriteria.dummy()
 
@@ -642,10 +1002,10 @@ class Objective(Creatable):
     @override
     def create_command(self) -> "Command":
         """创建scoreboard objective add命令"""
-        return Command("scoreboard", "objectives", "add", self.name, self.criteria)
+        return ScoreboardObjectivesAddCommand(self)
 
 
-class Score(Argument):
+class Score(String):
     name: str | Selector
     objective: Objective
 
@@ -659,12 +1019,15 @@ class Score(Argument):
         return f"{self.name} {self.objective}"
 
 
-class Range(Argument, ABC):
+class Range(Argument["Range"], ABC):
     end: object
     start: object
 
     def __init__(self, start: object, end: object):
-        super().__init__()
+        is_dynamic = False
+        if isinstance(start, MacroArgument) or isinstance(end, MacroArgument):
+            is_dynamic = True
+        super().__init__(dynamic=is_dynamic)
         self.start = start
         self.end = end
 
@@ -679,12 +1042,12 @@ class IntRange(Range):
 
 
 class FloatRange(Range):
-    def __init__(self, start: int | float | MacroArgument[Numeric], end: int | float | MacroArgument[Numeric]):
+    def __init__(self, start: int | float | MacroArgument[Numeric[object, object]], end: int | float | MacroArgument[Numeric[object, object]]):
         super().__init__(start, end)
 
 
-class MacroArgument(Argument, Generic[TBaseCovariant], ABC):
-    """参数基类"""
+class MacroArgument(Base[TCovariant], Generic[TCovariant], ABC):
+    """宏参数基类"""
     name: str
 
     def __init__(self, name: str):
@@ -752,12 +1115,11 @@ if __name__ == "__main__":
             main.set(my_int, Int(5))
             with main.if_(my_objective.self(), '<=', 100).sub_function("if_block") as if_block:
                 if_block.say("Score is greater than or equal to 10")
-                if_block.store(my_objective["test"]).random(IntRange(1, my_int))
-                if_block.call_function(namespace.path_namespace_id(("my_function", DynamicString.t(t"function{macro_i}"))))
+                if_block.store("result", my_objective["test"]).random_value(IntRange(1, my_int))
+                if_block.call_function(Function(namespace.path_namespace_id(("my_function", DynamicString.t(t"function{macro_i}"))), virtual=True))
 
         with namespace.function(("energy_tide",)) as energy_tide:
             energy_tide.say(1)
-
 
     with Namespace("other_namespace") as other_namespace:
         with other_namespace.function(("other_function",)) as other:
