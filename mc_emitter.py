@@ -6,7 +6,7 @@ from collections import defaultdict
 from enum import Enum
 from string.templatelib import Template, Interpolation
 from types import TracebackType
-from typing import Self, Generic, TypeVar, override, overload, Literal
+from typing import Self, Generic, override, overload, Literal, TypeVar
 
 T = TypeVar('T')
 TCovariant = TypeVar('TCovariant', covariant=True)
@@ -1367,7 +1367,7 @@ class Config:
     MINECRAFT_NAMESPACE: Namespace = Namespace("minecraft")
     FUNCTION_REGISTRY_CLEANUP_ON_EXIT: bool = True
     ARGUMENT_STORAGE: Storage = Storage(DEFAULT_NAMESPACE, "args")
-    OUTPUT_DIR: str = "output/"
+    OUTPUT_DIR: str = "../output/"
     IDENTIFIER_ALLOWED: set[str] = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
 
@@ -1389,44 +1389,3 @@ PREDEFINED_SCOREBOARD_CRITERIA: dict[str, ScoreboardCriteria] = {
     "dummy": ScoreboardSingleCriteria("dummy"),
 }
 
-# ==============================
-# 示例使用
-# ==============================
-if __name__ == "__main__":
-    # 创建上下文
-
-    my_objective = Objective("my_scoreboard")
-
-    my_int: IntMacroArgument = IntMacroArgument("my_int")
-    macro_i: IntMacroArgument = IntMacroArgument("i")
-
-    # 创建函数
-    with Config.DEFAULT_NAMESPACE as namespace:
-        with namespace.function(("my_function",)) as main:
-            main.say("Hello, world!", Selector.self())
-            main.create(my_objective)
-            with main.as_and_at(Selector.all()).sub_function("child_function") as child:
-                child.say("Child function", Selector.self())
-                child.say("2")
-                child.comment("This is a comment")
-                child.say("3")
-                child.set(my_objective.self(), 10)
-            main.set(my_int, NbtInt(5))
-            with main.if_(my_objective.self(), '<=', 100).sub_function("if_block") as if_block:
-                if_block.say("Score is greater than or equal to 10")
-                if_block.store("result", my_objective["test"]).random_value(IntRange(1, my_int))
-                if_block.call_function(Function(namespace.path_namespace_id(("my_function", DynamicString.t(t"function{macro_i}"))), virtual=True))
-
-        with namespace.function(("energy_tide",)) as energy_tide:
-            energy_tide.say(1)
-
-    with Namespace("other_namespace") as other_namespace:
-        with other_namespace.function(("other_function",)) as other:
-            other.say("Other function", Selector.self())
-            with other.sub_function("other") as other1:
-                other1.say("Other function 2", Selector.self())
-                with other1.sub_function("other") as other2:
-                    other2.say("Other function 3", Selector.self(), my_int)
-
-    Registries.FUNCTION_REGISTRY.print_registered_functions()
-    Registries.FUNCTION_REGISTRY.save_registered_functions()
