@@ -52,6 +52,11 @@ class Argument(ABC):
     def is_dynamic(self) -> bool:
         pass
 
+    @property
+    @abstractmethod
+    def macro_arguments(self) -> set[MacroArgument]:
+        pass
+
 
 class NumericType(Argument, ABC): pass
 
@@ -111,6 +116,11 @@ class NbtNumeric(NbtBase, NbtNumericType, Generic[T], ABC):
     def is_dynamic(self) -> bool:
         return False
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return set()
+
 
 class NbtInt(NbtNumeric[int], NbtIntType):
 
@@ -136,6 +146,13 @@ class NbtString(NbtBase, NbtStringType):
                 return True
 
         return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.value, DynamicString):
+            return self.value.macro_arguments
+        return set()
 
 
 class DynamicString(StringType):
@@ -167,6 +184,11 @@ class DynamicString(StringType):
         if any(isinstance(symbol, MacroArgument) for symbol in self.symbols):
             return True
         return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return {symbol for symbol in self.symbols if isinstance(symbol, MacroArgument)}
 
 
 class Namespace:
@@ -265,6 +287,13 @@ class NamespacedId(Argument):
 
         return False
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.id, DynamicString):
+            return self.id.macro_arguments
+        return set()
+
 
 class PathNamespacedId(NamespacedId):
     """路径式命名空间ID处理类，负责路径式命名空间ID的生成和解析"""
@@ -272,7 +301,19 @@ class PathNamespacedId(NamespacedId):
     path: tuple[str | DynamicString, ...]
 
     def __init__(self, namespace: Namespace, path: tuple[str | DynamicString, ...]):
-        super().__init__(namespace, '/'.join(map(str, path)))
+        if all(isinstance(part, str) for part in path):
+            super_path = "/".join(map(str, path))
+        else:
+            symbols: list[str | MacroArgument] = []
+            for i, part in enumerate(path):
+                if i > 0:
+                    symbols.append("/")
+                if isinstance(part, str):
+                    symbols.append(part)
+                else:
+                    symbols.extend(part.symbols)
+            super_path = DynamicString(*symbols)
+        super().__init__(namespace, super_path)
         self.path = path or ()
 
     def __add__(self, other: tuple[str | DynamicString, ...]):
@@ -347,7 +388,7 @@ class FunctionRegistry(Registry[PathNamespacedId, 'Function']):
         """打印所有注册的函数"""
         print("Registered functions:")
         for func in self.get_all():
-            print(f"\n{func}{" (macro)" if func.is_macro else ""}:")
+            print(f"\n{func}{f" (macro: {", ".join(i.name for i in func.macro_arguments_in_commands)})" if func.is_macro else ""}:")
             for cmd in func.commands:
                 print(f"  {cmd}")
 
@@ -446,6 +487,11 @@ class PathPart(ABC):
     def is_dynamic(self) -> bool:
         pass
 
+    @property
+    @abstractmethod
+    def macro_arguments(self) -> set[MacroArgument]:
+        pass
+
 
 class PathKey(PathPart):
     key: StringLike
@@ -464,6 +510,13 @@ class PathKey(PathPart):
         if isinstance(self.key, Argument):
             return self.key.is_dynamic
         return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.key, Argument):
+            return self.key.macro_arguments
+        return set()
 
     @override
     def __str__(self):
@@ -489,6 +542,13 @@ class PathIndex(PathPart):
 
     @property
     @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.index, Argument):
+            return self.index.macro_arguments
+        return set()
+
+    @property
+    @override
     def is_need_dot(self) -> bool:
         return False
 
@@ -509,6 +569,11 @@ class Path(Argument):
     @override
     def is_dynamic(self) -> bool:
         return any(part.is_dynamic for part in self.parts)
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return {macro_arg for part in self.parts for macro_arg in part.macro_arguments}
 
     @override
     def __str__(self):
@@ -591,6 +656,11 @@ class StorageDataPointer(DataPointer[TBaseCovariant], Generic[TBaseCovariant]):
     def is_dynamic(self) -> bool:
         return self.storage.is_dynamic or self.path.is_dynamic
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return self.storage.macro_arguments | self.path.macro_arguments
+
 
 class CommandBase(ABC):
 
@@ -605,6 +675,10 @@ class CommandBase(ABC):
             if isinstance(part, Argument) and part.is_dynamic:
                 return True
         return False
+
+    @property
+    def macro_arguments(self) -> set[MacroArgument]:
+        return {macro_arg for part in self.parts if isinstance(part, Argument) for macro_arg in part.macro_arguments}
 
     @override
     def __str__(self) -> str:
@@ -722,9 +796,9 @@ class ExecuteIfScoreSubCommand(ExecuteIfSubCommand, ABC):
 class ExecuteIfScoreMatchesSubCommand(ExecuteIfScoreSubCommand):
     range: IntRange | IntLike
 
-    def __init__(self, score: Score, range: IntRange | IntLike, reverse: bool = False):
-        super().__init__(score, reverse)
-        self.range = range
+    def __init__(self, score_match: ScoreMatch, reverse: bool = False):
+        super().__init__(score_match.score, reverse)
+        self.range = score_match.range
 
     @property
     @override
@@ -732,14 +806,14 @@ class ExecuteIfScoreMatchesSubCommand(ExecuteIfScoreSubCommand):
         return super().parts + ["matches", self.range]
 
 
-class ExecuteIfScoreOpSubCommand(ExecuteIfScoreSubCommand):
+class ExecuteIfScoreComparisonSubCommand(ExecuteIfScoreSubCommand):
     op: CompOp
     score2: Score
 
-    def __init__(self, score: Score, op: CompOp, score2: Score, reverse: bool = False):
-        super().__init__(score, reverse)
-        self.op = op
-        self.score2 = score2
+    def __init__(self, score_comparison: ScoreComparison, reverse: bool = False):
+        super().__init__(score_comparison.score, reverse)
+        self.op = score_comparison.comparison
+        self.score2 = score_comparison.score2
 
     @property
     @override
@@ -1091,6 +1165,19 @@ class ReturnFailCommand(ReturnCommand):
         return super().parts + ["fail"]
 
 
+class ReturnValueCommand(ReturnCommand):
+    value: IntLike
+
+    def __init__(self, value: IntLike):
+        super().__init__()
+        self.value = value
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + [self.value]
+
+
 class Function(PathNamespacedId):
     """函数类，负责管理一组命令"""
     opened: bool
@@ -1107,6 +1194,7 @@ class Function(PathNamespacedId):
         self.modified_macro_arguments: set[MacroArgument] = set()
         self.create_from: Function | None = None
         self.virtual: bool = virtual
+        self.macro_arguments_in_commands: set[MacroArgument] = set()
 
         # 当前命令上下文参数
         self.context_stack: list[ExecuteSubCommand] = []
@@ -1127,6 +1215,7 @@ class Function(PathNamespacedId):
 
         if command.is_dynamic:
             self.is_macro = True
+        self.macro_arguments_in_commands.update(command.macro_arguments)
 
     def add_commands(self, commands: list[Command]) -> None:
         """添加多个命令"""
@@ -1240,6 +1329,10 @@ class Function(PathNamespacedId):
         """创建返回失败命令"""
         return self._finalize_command(ReturnFailCommand())
 
+    def return_value(self, value: IntLike = 0) -> Command:
+        """创建返回值命令"""
+        return self._finalize_command(ReturnValueCommand(value))
+
     # add commands here ...
 
     def _add_execute_sub_command(self, sub_command: ExecuteSubCommand) -> "Function":
@@ -1260,23 +1353,15 @@ class Function(PathNamespacedId):
         return self.as_(selector).at(Selector.self())
 
     @overload
-    def if_(self, score: Score, operator: CompOp, value: IntLike | Score, reverse: bool = False, /) -> "Function":
-        ...
-
-    @overload
-    def if_(self, score: Score, value: IntLike, reverse: bool = False, /) -> "Function":
-        ...
-
-    @overload
-    def if_(self, score: Score, range: Range, reverse: bool = False, /) -> "Function":
-        ...
-
-    @overload
     def if_(self, score: Score, start: IntLike, end: IntLike, reverse: bool = False, /) -> "Function":
         ...
 
     @overload
-    def if_(self, selector: Selector, reverse: bool = False, /) -> Function:
+    def if_(self, score: Score, value: IntLike | IntRange, reverse: bool = False, /) -> "Function":
+        ...
+
+    @overload
+    def if_(self, condition: Selector | ScoreMatch | ScoreComparison, reverse: bool = False, /) -> Function:
         ...
 
     def if_(self, *args: object) -> "Function":
@@ -1290,80 +1375,48 @@ class Function(PathNamespacedId):
             args = args[:-1]
 
         match args:
-            case (Score() as score, str(operator), IntMacroArgument() as value):
-                match operator:
-                    case '=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value, reverse))
-                    case '>=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None), reverse))
-                    case '<=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value), reverse))
-                    case _:
-                        raise ValueError(f"Invalid operator: {operator}")
-            case (Score() as score, str(operator), int(value)):
-                match operator:
-                    case '=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value, reverse))
-                    case '>=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None), reverse))
-                    case '<=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value), reverse))
-                    case '>':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value + 1, None), reverse))
-                    case '<':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value - 1), reverse))
-                    case _:
-                        raise ValueError(f"Invalid operator: {operator}")
-            case (Score() as score, int(value)):
-                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value, reverse))
-            case (Score() as score, IntRange() as range):
-                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, range, reverse))
+            case (ScoreMatch() as match, ):
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(match, reverse))
+            case (ScoreComparison() as comparison, ):
+                return self._add_execute_sub_command(ExecuteIfScoreComparisonSubCommand(comparison, reverse))
+            case (Score() as score, int() | IntType() | IntRange()):
+                # noinspection PyTypeChecker
+                value: IntLike | IntRange = args[1]
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score.match(value), reverse))
             case (Score() as score, int(start), int(end)):
-                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(start, end), reverse))
-            case (Score() as score, str(operator), Score() as value):
-                operator = typing.cast(CompOp, operator)
-                return self._add_execute_sub_command(ExecuteIfScoreOpSubCommand(score, operator, value, reverse))
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score.match(IntRange(start, end)), reverse))
             case (Selector() as selector, ):
                 return self._add_execute_sub_command(ExecuteIfEntitySubCommand(selector, reverse))
             case _:
                 raise ValueError(f"Invalid arguments: {original_args}")
 
     @overload
-    def unless(self, score: Score, operator: CompOp, value: IntLike, /) -> "Function":
-        ...
-
-    @overload
-    def unless(self, score: Score, value: IntLike, /) -> "Function":
-        ...
-
-    @overload
-    def unless(self, score: Score, range: Range, /) -> "Function":
-        ...
-
-    @overload
     def unless(self, score: Score, start: IntLike, end: IntLike, /) -> "Function":
         ...
 
     @overload
-    def unless(self, selector: Selector, /) -> Function:
+    def unless(self, score: Score, value: IntLike | IntRange, reverse: bool = False, /) -> "Function":
+        ...
+
+    @overload
+    def unless(self, condition: Selector | ScoreMatch | ScoreComparison, /) -> Function:
         ...
 
     def unless(self, *args: object) -> Function:
+        reverse = True
         match args:
-            case (Score() as score, str(operator), IntMacroArgument() as value):
-                operator = typing.cast(CompOp, operator)
-                return self.if_(score, operator, value, True)
-            case (Score() as score, str(operator), int(value)):
-                operator = typing.cast(CompOp, operator)
-                return self.if_(score, operator, value, True)
-            case (Score() as score, int(value)):
-                return self.if_(score, value, True)
-            case (Score() as score, IntRange() as range):
-                return self.if_(score, range, True)
+            case (ScoreMatch() as match, ):
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(match, reverse))
+            case (ScoreComparison() as comparison, ):
+                return self._add_execute_sub_command(ExecuteIfScoreComparisonSubCommand(comparison, reverse))
+            case (Score() as score, int() | IntType() | IntRange()):
+                # noinspection PyTypeChecker
+                value: IntLike | IntRange = args[1]
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score.match(value), reverse))
             case (Score() as score, int(start), int(end)):
-                return self.if_(score, start, end, True)
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score.match(IntRange(start, end)), reverse))
             case (Selector() as selector, ):
-                return self.if_(selector, True)
+                return self._add_execute_sub_command(ExecuteIfEntitySubCommand(selector, reverse))
             case _:
                 raise ValueError(f"Invalid arguments: {args}")
 
@@ -1418,6 +1471,11 @@ class SelectorArgument(ABC):
     def name(self) -> str:
         pass
 
+    @property
+    @abstractmethod
+    def macro_arguments(self) -> set[MacroArgument]:
+        pass
+
 
 class SelectorArgumentReversible(SelectorArgument, ABC):
     """可逆选择器参数基类"""
@@ -1449,6 +1507,11 @@ class SelectorDistanceArgument(SelectorArgument):
     def __str__(self) -> str:
         return str(self.distance)
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return self.distance.macro_arguments
+
 
 class SelectorTagArgument(SelectorArgumentReversible):
     """选择器tag参数"""
@@ -1473,6 +1536,11 @@ class SelectorTagArgument(SelectorArgumentReversible):
     def __str__(self) -> str:
         return f"{self.tag}"
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return self.tag.macro_arguments
+
 
 class SelectorScoresArgument(SelectorArgument):
     """选择器scores参数"""
@@ -1492,6 +1560,15 @@ class SelectorScoresArgument(SelectorArgument):
 
     @property
     @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        result: set[MacroArgument] = set()
+        for objective, range in self.scores.items():
+            if isinstance(range, IntRange | IntType):
+                result |= range.macro_arguments
+        return result
+
+    @property
+    @override
     def name(self) -> str:
         return "scores"
 
@@ -1503,10 +1580,10 @@ class SelectorScoresArgument(SelectorArgument):
 class Selector(Argument):
     """命令选择器"""
 
-    def __init__(self, var: SelectorVariable):
+    def __init__(self, var: SelectorVariable, *args: SelectorArgument):
         super().__init__()
         self.var: SelectorVariable = var
-        self.arguments: list[SelectorArgument] = []
+        self.arguments: tuple[SelectorArgument, ...] = args
 
     @classmethod
     def self(cls) -> Selector:
@@ -1525,16 +1602,13 @@ class Selector(Argument):
         return cls(SelectorVariable.NEAREST_PLAYER)
 
     def distance(self, distance: Range):
-        self.arguments.append(SelectorDistanceArgument(distance))
-        return self
+        return type(self)(self.var, *self.arguments, SelectorDistanceArgument(distance))
 
     def tag(self, tag: Tag, reverse: bool = False):
-        self.arguments.append(SelectorTagArgument(tag, reverse))
-        return self
+        return type(self)(self.var, *self.arguments, SelectorTagArgument(tag, reverse))
 
     def scores(self, scores: dict[Objective, IntLike | IntRange]):
-        self.arguments.append(SelectorScoresArgument(scores))
-        return self
+        return type(self)(self.var, *self.arguments, SelectorScoresArgument(scores))
 
     @override
     def __str__(self) -> str:
@@ -1553,6 +1627,14 @@ class Selector(Argument):
             if arg.is_dynamic:
                 return True
         return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        result: set[MacroArgument] = set()
+        for arg in self.arguments:
+            result |= arg.macro_arguments
+        return result
 
 
 class ScoreboardCriteria(Argument, ABC):
@@ -1575,6 +1657,11 @@ class ScoreboardSingleCriteria(ScoreboardCriteria):
     def is_dynamic(self) -> bool:
         return False
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return set()
+
 
 class Tag(Argument):
     name: StringLike
@@ -1594,6 +1681,13 @@ class Tag(Argument):
             if self.name.is_dynamic:
                 return True
         return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.name, StringType):
+            return self.name.macro_arguments
+        return set()
 
 
 class Objective(Argument, Creatable):
@@ -1629,6 +1723,13 @@ class Objective(Argument, Creatable):
                 return True
         return False
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.name, StringType):
+            return self.name.macro_arguments
+        return set()
+
 
 class ScoreOperation:
     score: Score
@@ -1643,6 +1744,26 @@ class ScoreOperation:
     @property
     def assignment_op(self) -> Literal["+=", "-=", "*=", "/=", "%="]:
         return typing.cast(Literal["+=", "-=", "*=", "/=", "%="], f"{self.operation}=")
+
+
+class ScoreComparison:
+    score: Score
+    comparison: CompOp
+    score2: Score
+
+    def __init__(self, score: Score, comparison: CompOp, score2: Score):
+        self.score = score
+        self.comparison = comparison
+        self.score2 = score2
+
+
+class ScoreMatch:
+    score: Score
+    range: IntRange
+
+    def __init__(self, score: Score, range: IntRange):
+        self.score = score
+        self.range = range
 
 
 class Score(Argument):
@@ -1666,6 +1787,13 @@ class Score(Argument):
                 return True
         return False
 
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.name, Argument):
+            return self.name.macro_arguments
+        return set()
+
     def __floordiv__(self, other: Score) -> ScoreOperation:
         return ScoreOperation(self, "/", other)
 
@@ -1681,6 +1809,83 @@ class Score(Argument):
     def __mod__(self, other: Score) -> ScoreOperation:
         return ScoreOperation(self, "%", other)
 
+    @overload
+    def __lt__(self, other: Score) -> ScoreComparison:
+        ...
+
+    @overload
+    def __lt__(self, other: int) -> ScoreMatch:
+        ...
+
+    def __lt__(self, other: Score | int) -> ScoreComparison | ScoreMatch:
+        match other:
+            case Score():
+                return ScoreComparison(self, "<", other)
+            case int():
+                return ScoreMatch(self, IntRange(None, other - 1))
+
+    @overload
+    def __le__(self, other: Score) -> ScoreComparison:
+        ...
+
+    @overload
+    def __le__(self, other: IntLike) -> ScoreMatch:
+        ...
+
+    def __le__(self, other: Score | IntLike) -> ScoreComparison | ScoreMatch:
+        match other:
+            case Score():
+                return ScoreComparison(self, "<=", other)
+            case int() | IntType():
+                return ScoreMatch(self, IntRange(None, other))
+
+    @overload
+    def __gt__(self, other: Score) -> ScoreComparison:
+        ...
+
+    @overload
+    def __gt__(self, other: int) -> ScoreMatch:
+        ...
+
+    def __gt__(self, other: Score | int) -> ScoreComparison | ScoreMatch:
+        match other:
+            case Score():
+                return ScoreComparison(self, ">", other)
+            case int():
+                return ScoreMatch(self, IntRange(other + 1, None))
+
+    @overload
+    def __ge__(self, other: Score) -> ScoreComparison:
+        ...
+
+    @overload
+    def __ge__(self, other: IntLike) -> ScoreMatch:
+        ...
+
+    def __ge__(self, other: Score | IntLike) -> ScoreComparison | ScoreMatch:
+        match other:
+            case Score():
+                return ScoreComparison(self, ">=", other)
+            case int() | IntType():
+                return ScoreMatch(self, IntRange(other, None))
+
+    @overload
+    def match(self, other: Score) -> ScoreComparison:
+        ...
+
+    @overload
+    def match(self, other: IntLike | IntRange) -> ScoreMatch:
+        ...
+
+    def match(self, other: Score | IntLike | IntRange) -> ScoreComparison | ScoreMatch:
+        match other:
+            case Score():
+                return ScoreComparison(self, "=", other)
+            case int() | IntType():
+                return ScoreMatch(self, IntRange(other, other))
+            case IntRange():
+                return ScoreMatch(self, other)
+
 
 class Range(Argument, ABC):
     end: object
@@ -1692,7 +1897,19 @@ class Range(Argument, ABC):
 
     @override
     def __str__(self):
-        return f"{self.start or ''}..{self.end or ''}"
+        if self.start is None and self.end is None:
+            return ".."
+        if self.start == self.end:
+            return str(self.start)
+        if self.start is None:
+            start = ""
+        else:
+            start = str(self.start)
+        if self.end is None:
+            end = ""
+        else:
+            end = str(self.end)
+        return f"{start or ''}..{end or ''}"
 
     @property
     @override
@@ -1700,6 +1917,11 @@ class Range(Argument, ABC):
         if isinstance(self.start, MacroArgument) or isinstance(self.end, MacroArgument):
             return True
         return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return {i for i in (self.start, self.end) if isinstance(i, MacroArgument)}
 
 
 class IntRange(Range):
@@ -1736,6 +1958,11 @@ class MacroArgument(Argument, ABC):
     @override
     def is_dynamic(self) -> bool:
         return True
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return {self}
 
     @property
     @abstractmethod
@@ -1784,7 +2011,7 @@ class ForContext:
         if self.macro_argument is not None:
             self.function.store("result", self.macro_argument).get(self.index)
         self.sub_function = self.function.sub_function(*self.path).__enter__()
-        self.sub_function.if_(self.index, ">=", self.total).return_fail()
+        self.sub_function.if_(self.index >= self.total).return_fail()
         return self.sub_function
 
     def __exit__(self, exc_type: type, exc_val: BaseException, exc_tb: TracebackType):
