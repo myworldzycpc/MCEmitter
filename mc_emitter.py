@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import typing
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
@@ -52,10 +53,13 @@ class Argument(ABC):
         pass
 
 
-class IntType(Argument, ABC): pass
+class NumericType(Argument, ABC): pass
 
 
-class FloatType(Argument, ABC): pass
+class IntType(NumericType, ABC): pass
+
+
+class FloatType(NumericType, ABC): pass
 
 
 class StringType(Argument, ABC): pass
@@ -201,7 +205,7 @@ class Namespace:
     def path_namespace_id(self, path: tuple[str | DynamicString, ...]):
         return PathNamespacedId(self, path)
 
-    def function(self, path: tuple[str], commands: list[Command] | None = None, limit_entities: None = None):
+    def function(self, path: tuple[str, ...], commands: list[Command] | None = None, limit_entities: None = None):
         return Function(self.path_namespace_id(path), commands=commands, limit_entities=limit_entities)
 
 
@@ -265,7 +269,7 @@ class NamespacedId(Argument):
 class PathNamespacedId(NamespacedId):
     """路径式命名空间ID处理类，负责路径式命名空间ID的生成和解析"""
 
-    path: tuple[str | DynamicString, ...] | tuple[()]
+    path: tuple[str | DynamicString, ...]
 
     def __init__(self, namespace: Namespace, path: tuple[str | DynamicString, ...]):
         super().__init__(namespace, '/'.join(map(str, path)))
@@ -316,19 +320,25 @@ class Registry(Generic[K, T]):
     def get_all(self) -> list[T]:
         return list(self._items.values())
 
+    def __getitem__(self, item: K):
+        return self.get(item)
+
+    def __contains__(self, item: K):
+        return item in self._items
+
 
 class FunctionRegistry(Registry[PathNamespacedId, 'Function']):
     """函数注册表，专门负责Function实例的管理"""
 
     def __init__(self):
         super().__init__("Function")
-        self._anonymous_counter: defaultdict[tuple[str, ...], int] = defaultdict(int)
+        self._anonymous_counter: defaultdict[Function, int] = defaultdict(int)
 
     def register_function(self, function: Function) -> None:
         """注册函数实例"""
         self.register(function, function)
 
-    def get_auto_id(self, path: tuple[str, ...]) -> int:
+    def get_auto_id(self, path: Function) -> int:
         """生成匿名函数ID"""
         self._anonymous_counter[path] += 1
         return self._anonymous_counter[path] - 1
@@ -358,9 +368,17 @@ class ObjectiveRegistry(Registry[str, 'Objective']):
     def __init__(self):
         super().__init__("Objective")
 
-    def register_objective(self, objective: "Objective") -> None:
+    def register_objective(self, objective: Objective) -> None:
         """注册计分板目标实例"""
         self.register(str(objective.name), objective)
+
+    def create_or_get(self, name: str, criteria: ScoreboardCriteria | None = None) -> Objective:
+        """获取或创建计分板目标实例"""
+        if name in self:
+            return self[name]
+        else:
+            objective = Objective(name, criteria)
+            return objective
 
 
 class MacroArgumentRegistry(Registry[str, "MacroArgument"]):
@@ -385,11 +403,23 @@ class NamespaceRegistry(Registry[str, Namespace]):
         self.register(namespace.name, namespace)
 
 
+class TagRegistry(Registry[str, "Tag"]):
+    """标签注册表，专门负责标签的管理"""
+
+    def __init__(self):
+        super().__init__("Tag")
+
+    def register_tag(self, tag: Tag):
+        """注册标签实例"""
+        self.register(str(tag.name), tag)
+
+
 class Registries:
     FUNCTION_REGISTRY: FunctionRegistry = FunctionRegistry()
     OBJECTIVE_REGISTRY: ObjectiveRegistry = ObjectiveRegistry()
     MACRO_ARGUMENT_REGISTRY: MacroArgumentRegistry = MacroArgumentRegistry()
     NAMESPACE_REGISTRY: NamespaceRegistry = NamespaceRegistry()
+    TAG_REGISTRY: TagRegistry = TagRegistry()
 
 
 # ==============================
@@ -563,8 +593,6 @@ class StorageDataPointer(DataPointer[TBaseCovariant], Generic[TBaseCovariant]):
 
 
 class CommandBase(ABC):
-    def __init__(self):
-        pass
 
     @property
     @abstractmethod
@@ -608,6 +636,13 @@ class CommentCommand(Command):
     @override
     def parts(self) -> list[CommandPartCompatible]:
         return ["#"] + list(self.args)
+
+
+class BlankCommand(Command):
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return []
 
 
 class SayCommand(Command):
@@ -657,18 +692,24 @@ class ExecuteAtSubCommand(ExecuteSubCommand):
 
 
 class ExecuteIfSubCommand(ExecuteSubCommand, ABC):
+    reverse: bool
+
+    def __init__(self, reverse: bool = False):
+        super().__init__()
+        self.reverse = reverse
+
     @property
     @override
     @abstractmethod
     def parts(self) -> list[CommandPartCompatible]:
-        return ["if"]
+        return ["unless" if self.reverse else "if"]
 
 
 class ExecuteIfScoreSubCommand(ExecuteIfSubCommand, ABC):
     score: Score
 
-    def __init__(self, score: Score):
-        super().__init__()
+    def __init__(self, score: Score, reverse: bool = False):
+        super().__init__(reverse)
         self.score = score
 
     @property
@@ -681,8 +722,8 @@ class ExecuteIfScoreSubCommand(ExecuteIfSubCommand, ABC):
 class ExecuteIfScoreMatchesSubCommand(ExecuteIfScoreSubCommand):
     range: IntRange | IntLike
 
-    def __init__(self, score: Score, range: IntRange | IntLike):
-        super().__init__(score)
+    def __init__(self, score: Score, range: IntRange | IntLike, reverse: bool = False):
+        super().__init__(score, reverse)
         self.range = range
 
     @property
@@ -695,8 +736,8 @@ class ExecuteIfScoreOpSubCommand(ExecuteIfScoreSubCommand):
     op: CompOp
     score2: Score
 
-    def __init__(self, score: Score, op: CompOp, score2: Score):
-        super().__init__(score)
+    def __init__(self, score: Score, op: CompOp, score2: Score, reverse: bool = False):
+        super().__init__(score, reverse)
         self.op = op
         self.score2 = score2
 
@@ -706,11 +747,23 @@ class ExecuteIfScoreOpSubCommand(ExecuteIfScoreSubCommand):
         return super().parts + [self.op, self.score2]
 
 
+class ExecuteIfEntitySubCommand(ExecuteIfSubCommand):
+    selector: Selector
+
+    def __init__(self, selector: Selector, reverse: bool = False):
+        super().__init__(reverse)
+        self.selector = selector
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["entity", self.selector]
+
+
 class ExecuteStoreSubCommand(ExecuteSubCommand, ABC):
     type: Literal["result", "success"]
 
     def __init__(self, type: Literal["result", "success"]):
-        super().__init__()
         self.type = type
 
     @property
@@ -753,7 +806,6 @@ class ExecuteCommand(Command):
     sub_commands: list[ExecuteSubCommand]
 
     def __init__(self, sub_commands: list[ExecuteSubCommand], run: Command):
-        super().__init__()
         if isinstance(run, CommentCommand):
             raise ValueError("Cannot add comment inside execute context")
         self.sub_commands = sub_commands
@@ -790,7 +842,6 @@ class RandomValueCommand(RandomRangeCommand):
     mode: Literal["value", "roll"] = "value"
 
     def __init__(self, range: IntRange):
-        super().__init__()
         self.range = range
 
 
@@ -800,7 +851,6 @@ class RandomRollCommand(RandomRangeCommand):
     mode: Literal["value", "roll"] = "roll"
 
     def __init__(self, range: IntRange):
-        super().__init__()
         self.range = range
 
 
@@ -827,7 +877,6 @@ class ScoreboardObjectivesAddCommand(ScoreboardObjectivesCommand):
     objective: Objective
 
     def __init__(self, objective: Objective):
-        super().__init__()
         self.objective = objective
 
     @property
@@ -846,19 +895,67 @@ class ScoreboardPlayersCommand(ScoreboardCommand, ABC):
         return super().parts + ["players"]
 
 
-class ScoreboardPlayersSetCommand(ScoreboardPlayersCommand):
+class ScoreboardPlayersGetCommand(ScoreboardCommand):
     score: Score
+
+    def __init__(self, score: Score):
+        self.score = score
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["get", self.score]
+
+
+class ScoreboardPlayersSimpleCommand(ScoreboardPlayersCommand):
+    score: Score
+    operation: Literal["set", "add", "remove"]
     value: IntLike
 
-    def __init__(self, score: Score, value: IntLike):
-        super().__init__()
+    def __init__(self, score: Score, operation: Literal["set", "add", "remove"], value: IntLike):
         self.score = score
+        self.operation = operation
         self.value = value
 
     @property
     @override
     def parts(self) -> list[CommandPartCompatible]:
-        return super().parts + ["set", self.score, self.value]
+        return super().parts + [self.operation, self.score, self.value]
+
+
+class ScoreboardPlayersSetCommand(ScoreboardPlayersSimpleCommand):
+
+    def __init__(self, score: Score, value: IntLike):
+        super().__init__(score, "set", value)
+
+
+class ScoreboardPlayersAddCommand(ScoreboardPlayersSimpleCommand):
+
+    def __init__(self, score: Score, value: IntLike):
+        super().__init__(score, "add", value)
+
+
+class ScoreboardPlayersRemoveCommand(ScoreboardPlayersSimpleCommand):
+
+    def __init__(self, score: Score, value: IntLike):
+        super().__init__(score, "remove", value)
+
+
+class ScoreboardPlayersOperationCommand(ScoreboardPlayersCommand):
+    score: Score
+    operation: Literal["+=", "-=", "*=", "/=", "%=", "=", "<", ">", "><"]
+    score2: Score
+
+    def __init__(self, score: Score, operation: Literal["+=", "-=", "*=", "/=", "%=", "=", "<", ">", "><"], score2: Score):
+        super().__init__()
+        self.score = score
+        self.operation = operation
+        self.score2 = score2
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["operation", self.score, self.operation, self.score2]
 
 
 class DataCommand(Command, ABC):
@@ -868,6 +965,18 @@ class DataCommand(Command, ABC):
     @abstractmethod
     def parts(self) -> list[CommandPartCompatible]:
         return ["data"]
+
+
+class DataGetCommand(DataCommand, Generic[TBaseCovariant]):
+
+    def __init__(self, data_pointer: DataPointer[TBaseCovariant]):
+        super().__init__()
+        self.data_pointer: DataPointer[TBaseCovariant] = data_pointer
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["get"] + self.data_pointer.full_parts()
 
 
 class DataModifyCommand(DataCommand, Generic[TBaseCovariant], ABC):
@@ -925,6 +1034,61 @@ class FunctionCommand(Command):
         else:
             with_ = self.with_
         return list(["function", self.function] + (["with"] + with_.full_parts() if with_ is not None else []))
+
+
+class TagCommand(Command):
+    selector: Selector
+
+    def __init__(self, selector: Selector):
+        super().__init__()
+        self.selector = selector
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["tag", self.selector]
+
+
+class TagAddCommand(TagCommand):
+    tag: Tag
+
+    def __init__(self, selector: Selector, tag: Tag):
+        super().__init__(selector)
+        self.tag = tag
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["add", self.tag]
+
+
+class TagRemoveCommand(TagCommand):
+    tag: Tag
+
+    def __init__(self, selector: Selector, tag: Tag):
+        super().__init__(selector)
+        self.tag = tag
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["remove", self.tag]
+
+
+class ReturnCommand(Command):
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["return"]
+
+
+class ReturnFailCommand(ReturnCommand):
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return super().parts + ["fail"]
 
 
 class Function(PathNamespacedId):
@@ -999,30 +1163,57 @@ class Function(PathNamespacedId):
         self._finalize_command(obj.create_command())
         return obj
 
-    @overload
-    def set(self, target: Score, value: int, /) -> Command:
-        ...
-
-    @overload
-    def set(self, target: MacroArgument, value: NbtType, /) -> Command:
-        ...
-
-    def set(self, target: Score | MacroArgument, value: int | NbtType) -> Command:
+    def set(self, target: Score | MacroArgument, value: IntLike | NbtType | Score | ScoreOperation) -> Command:
         match target, value:
-            case Score(), int():
+            case Score(), int() | IntType():
                 return self._finalize_command(ScoreboardPlayersSetCommand(target, value))
+            case Score(), Score():
+                return self._finalize_command(ScoreboardPlayersOperationCommand(target, "=", value))
+            case Score(), ScoreOperation():
+                if len(self.context_stack) > 0:
+                    raise ValueError("Cannot use multi-command operation in execute context")
+                self._finalize_command(ScoreboardPlayersOperationCommand(target, "=", value.score))
+                return self._finalize_command(ScoreboardPlayersOperationCommand(target, value.assignment_op, value.score2))
             case MacroArgument(), NbtType():
                 self.modified_macro_arguments.add(target)
+                if not isinstance(value, target.expected_type):
+                    raise ValueError(f"Invalid value type: {value}, expected {target.expected_type}")
                 return self._finalize_command(DataModifySetValueCommand(StorageDataPointer(Config.ARGUMENT_STORAGE, Path()[target.name], target.expected_type), value))
+            case MacroArgument(), Score():
+                return self.store("result", target).get(value)
             case _:
                 raise ValueError(f"Invalid target or value: {target}, {value}")
 
-    def call_function(self, function: Function, with_: DataPointer[NbtCompoundType] | DataHolder | None | Literal["auto"] = "auto") -> Command:
+    def add(self, target: Score, value: IntLike | Score):
+        match value:
+            case int() | IntType():
+                return self._finalize_command(ScoreboardPlayersAddCommand(target, value))
+            case Score():
+                return self._finalize_command(ScoreboardPlayersOperationCommand(target, "+=", value))
+
+    def remove(self, target: Score, value: IntLike | Score):
+        match value:
+            case int() | IntType():
+                return self._finalize_command(ScoreboardPlayersRemoveCommand(target, value))
+            case Score():
+                return self._finalize_command(ScoreboardPlayersOperationCommand(target, "-=", value))
+
+    def get(self, target: Score | DataPointer[NbtType]):
+        """获取scoreboard或data命令"""
+        match target:
+            case Score():
+                return self._finalize_command(ScoreboardPlayersGetCommand(target))
+            case DataPointer():
+                return self._finalize_command(DataGetCommand(target))
+
+    def call_function(self, function: Function, with_: DataPointer[NbtCompoundType] | DataHolder | None | Literal["auto"] = "auto", args: dict[MacroArgument, NbtType] | None = None) -> Command:
         """创建调用函数的命令"""
         return self._finalize_command(FunctionCommand(function, with_))
 
     def sub_function(self, *path: str, commands: list[Command] | None = None, limit_entities: None = None) -> "Function":
         """创建子函数调用命令"""
+        if len(path) == 0:
+            path = (f"_{Registries.FUNCTION_REGISTRY.get_auto_id(self)}",)
         function = self.create_child(*path, commands=commands, limit_entities=limit_entities)
         function.create_from = self
         return function
@@ -1034,6 +1225,22 @@ class Function(PathNamespacedId):
     def comment(self, *args: CommandPartCompatible) -> Command:
         """创建注释命令"""
         return self._finalize_command(CommentCommand(*args))
+
+    def blank(self):
+        """创建空行"""
+        return self._finalize_command(BlankCommand())
+
+    def tag_add(self, tag: Tag, selector: Selector | None = None):
+        return self._finalize_command(TagAddCommand(selector or Selector.self(), tag))
+
+    def tag_remove(self, tag: Tag, selector: Selector | None = None):
+        return self._finalize_command(TagRemoveCommand(selector or Selector.self(), tag))
+
+    def return_fail(self) -> Command:
+        """创建返回失败命令"""
+        return self._finalize_command(ReturnFailCommand())
+
+    # add commands here ...
 
     def _add_execute_sub_command(self, sub_command: ExecuteSubCommand) -> "Function":
         """通用的execute修饰符添加方法（复用代码）"""
@@ -1048,58 +1255,115 @@ class Function(PathNamespacedId):
         """添加at修饰符"""
         return self._add_execute_sub_command(ExecuteAtSubCommand(selector))
 
-    def as_and_at(self, selector: Selector) -> "Function":
+    def ast(self, selector: Selector) -> "Function":
         """同时添加as和at修饰符（替代原ast方法，更易理解）"""
         return self.as_(selector).at(Selector.self())
 
     @overload
-    def if_(self, score: Score, operator: CompOp, value: IntLike, /) -> "Function":
+    def if_(self, score: Score, operator: CompOp, value: IntLike | Score, reverse: bool = False, /) -> "Function":
         ...
 
     @overload
-    def if_(self, score: Score, value: IntLike, /) -> "Function":
+    def if_(self, score: Score, value: IntLike, reverse: bool = False, /) -> "Function":
         ...
 
     @overload
-    def if_(self, score: Score, range: Range, /) -> "Function":
+    def if_(self, score: Score, range: Range, reverse: bool = False, /) -> "Function":
         ...
 
     @overload
-    def if_(self, score: Score, start: IntLike, end: IntLike, /) -> "Function":
+    def if_(self, score: Score, start: IntLike, end: IntLike, reverse: bool = False, /) -> "Function":
+        ...
+
+    @overload
+    def if_(self, selector: Selector, reverse: bool = False, /) -> Function:
         ...
 
     def if_(self, *args: object) -> "Function":
+        # 保存原始参数用于错误信息
+        original_args = args
+
+        # 提取可选的 reverse 参数（必须是布尔值且位于最后）
+        reverse = False
+        if args and isinstance(args[-1], bool):
+            reverse = args[-1]
+            args = args[:-1]
+
         match args:
             case (Score() as score, str(operator), IntMacroArgument() as value):
                 match operator:
                     case '=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value, reverse))
                     case '>=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None)))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None), reverse))
                     case '<=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value)))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value), reverse))
                     case _:
                         raise ValueError(f"Invalid operator: {operator}")
             case (Score() as score, str(operator), int(value)):
                 match operator:
                     case '=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value, reverse))
                     case '>=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None)))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value, None), reverse))
                     case '<=':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value)))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value), reverse))
                     case '>':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value + 1, None)))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(value + 1, None), reverse))
                     case '<':
-                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value - 1)))
+                        return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(None, value - 1), reverse))
                     case _:
                         raise ValueError(f"Invalid operator: {operator}")
             case (Score() as score, int(value)):
-                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value))
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, value, reverse))
             case (Score() as score, IntRange() as range):
-                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, range))
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, range, reverse))
             case (Score() as score, int(start), int(end)):
-                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(start, end)))
+                return self._add_execute_sub_command(ExecuteIfScoreMatchesSubCommand(score, IntRange(start, end), reverse))
+            case (Score() as score, str(operator), Score() as value):
+                operator = typing.cast(CompOp, operator)
+                return self._add_execute_sub_command(ExecuteIfScoreOpSubCommand(score, operator, value, reverse))
+            case (Selector() as selector, ):
+                return self._add_execute_sub_command(ExecuteIfEntitySubCommand(selector, reverse))
+            case _:
+                raise ValueError(f"Invalid arguments: {original_args}")
+
+    @overload
+    def unless(self, score: Score, operator: CompOp, value: IntLike, /) -> "Function":
+        ...
+
+    @overload
+    def unless(self, score: Score, value: IntLike, /) -> "Function":
+        ...
+
+    @overload
+    def unless(self, score: Score, range: Range, /) -> "Function":
+        ...
+
+    @overload
+    def unless(self, score: Score, start: IntLike, end: IntLike, /) -> "Function":
+        ...
+
+    @overload
+    def unless(self, selector: Selector, /) -> Function:
+        ...
+
+    def unless(self, *args: object) -> Function:
+        match args:
+            case (Score() as score, str(operator), IntMacroArgument() as value):
+                operator = typing.cast(CompOp, operator)
+                return self.if_(score, operator, value, True)
+            case (Score() as score, str(operator), int(value)):
+                operator = typing.cast(CompOp, operator)
+                return self.if_(score, operator, value, True)
+            case (Score() as score, int(value)):
+                return self.if_(score, value, True)
+            case (Score() as score, IntRange() as range):
+                return self.if_(score, range, True)
+            case (Score() as score, int(start), int(end)):
+                return self.if_(score, start, end, True)
+            case (Selector() as selector, ):
+                return self.if_(selector, True)
             case _:
                 raise ValueError(f"Invalid arguments: {args}")
 
@@ -1117,9 +1381,18 @@ class Function(PathNamespacedId):
             case Score():
                 return self._add_execute_sub_command(ExecuteStoreScoreSubCommand(type, target))
             case StorageDataPointer():
-                return self._add_execute_sub_command(ExecuteStoreDataSubCommand(type, target))
+                return self._add_execute_sub_command(ExecuteStoreDataSubCommand(type, target, scale))
+            case MacroArgument():
+                data_pointer = typing.cast(StorageDataPointer[NbtNumericType], target.data_pointer)
+                return self._add_execute_sub_command(ExecuteStoreDataSubCommand(type, data_pointer, scale))
             case _:
                 raise NotImplementedError("Unsupported target for store command")
+
+    def local_scb(self):
+        return Registries.OBJECTIVE_REGISTRY.create_or_get(".".join(("zzz", *map(str, self.path))))
+
+    def for_loop(self, num: IntLike | Score, end: IntLike | Score | None = None, step: IntLike | Score = 1, path: tuple[str, ...] = (), macro_argument: MacroArgument | None = None):
+        return ForContext(self, num, end, step, path, macro_argument)
 
 
 class SelectorVariable(Enum):
@@ -1146,6 +1419,14 @@ class SelectorArgument(ABC):
         pass
 
 
+class SelectorArgumentReversible(SelectorArgument, ABC):
+    """可逆选择器参数基类"""
+    reverse: bool
+
+    def __init__(self, reverse: bool = False):
+        self.reverse = reverse
+
+
 class SelectorDistanceArgument(SelectorArgument):
     """选择器距离参数"""
 
@@ -1169,6 +1450,56 @@ class SelectorDistanceArgument(SelectorArgument):
         return str(self.distance)
 
 
+class SelectorTagArgument(SelectorArgumentReversible):
+    """选择器tag参数"""
+
+    tag: Tag
+
+    def __init__(self, tag: Tag, reverse: bool = False):
+        super().__init__(reverse)
+        self.tag = tag
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return self.tag.is_dynamic
+
+    @property
+    @override
+    def name(self) -> str:
+        return "tag"
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.tag}"
+
+
+class SelectorScoresArgument(SelectorArgument):
+    """选择器scores参数"""
+
+    scores: dict[Objective, IntLike | IntRange]
+
+    def __init__(self, scores: dict[Objective, IntLike | IntRange]):
+        self.scores = scores
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        for objective, range in self.scores.items():
+            if objective.is_dynamic or (isinstance(range, IntRange | IntType) and range.is_dynamic):
+                return True
+        return False
+
+    @property
+    @override
+    def name(self) -> str:
+        return "scores"
+
+    @override
+    def __str__(self) -> str:
+        return "{" + ",".join(f"{objective}={range}" for objective, range in self.scores.items()) + "}"
+
+
 class Selector(Argument):
     """命令选择器"""
 
@@ -1186,11 +1517,24 @@ class Selector(Argument):
         return cls(SelectorVariable.ALL)
 
     @classmethod
+    def players(cls) -> Selector:
+        return cls(SelectorVariable.PLAYERS)
+
+    @classmethod
     def nearest_player(cls) -> Selector:
         return cls(SelectorVariable.NEAREST_PLAYER)
 
     def distance(self, distance: Range):
         self.arguments.append(SelectorDistanceArgument(distance))
+        return self
+
+    def tag(self, tag: Tag, reverse: bool = False):
+        self.arguments.append(SelectorTagArgument(tag, reverse))
+        return self
+
+    def scores(self, scores: dict[Objective, IntLike | IntRange]):
+        self.arguments.append(SelectorScoresArgument(scores))
+        return self
 
     @override
     def __str__(self) -> str:
@@ -1232,6 +1576,26 @@ class ScoreboardSingleCriteria(ScoreboardCriteria):
         return False
 
 
+class Tag(Argument):
+    name: StringLike
+
+    def __init__(self, name: StringLike):
+        self.name = name
+        Registries.TAG_REGISTRY.register_tag(self)
+
+    @override
+    def __str__(self):
+        return str(self.name)
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        if isinstance(self.name, StringType):
+            if self.name.is_dynamic:
+                return True
+        return False
+
+
 class Objective(Argument, Creatable):
     criteria: ScoreboardCriteria
     name: StringLike
@@ -1266,6 +1630,21 @@ class Objective(Argument, Creatable):
         return False
 
 
+class ScoreOperation:
+    score: Score
+    operation: Literal["+", "-", "*", "/", "%"]
+    score2: Score
+
+    def __init__(self, score: Score, operation: Literal["+", "-", "*", "/", "%"], score2: Score):
+        self.score = score
+        self.operation = operation
+        self.score2 = score2
+
+    @property
+    def assignment_op(self) -> Literal["+=", "-=", "*=", "/=", "%="]:
+        return typing.cast(Literal["+=", "-=", "*=", "/=", "%="], f"{self.operation}=")
+
+
 class Score(Argument):
     name: StringLike | Selector
     objective: Objective
@@ -1286,6 +1665,21 @@ class Score(Argument):
             if self.name.is_dynamic:
                 return True
         return False
+
+    def __floordiv__(self, other: Score) -> ScoreOperation:
+        return ScoreOperation(self, "/", other)
+
+    def __add__(self, other: Score) -> ScoreOperation:
+        return ScoreOperation(self, "+", other)
+
+    def __sub__(self, other: Score) -> ScoreOperation:
+        return ScoreOperation(self, "-", other)
+
+    def __mul__(self, other: Score) -> ScoreOperation:
+        return ScoreOperation(self, "*", other)
+
+    def __mod__(self, other: Score) -> ScoreOperation:
+        return ScoreOperation(self, "%", other)
 
 
 class Range(Argument, ABC):
@@ -1349,17 +1743,57 @@ class MacroArgument(Argument, ABC):
         pass
 
     @property
-    def data_pointer(self) -> DataPointer[NbtType]:
+    def data_pointer(self) -> StorageDataPointer[NbtType]:
         return StorageDataPointer(Config.ARGUMENT_STORAGE, Path()[self.name], self.expected_type)
 
 
-class IntMacroArgument(IntType, NbtIntType, MacroArgument):
+class NumericMacroArgument(NumericType, NbtNumericType, MacroArgument, ABC):
+    pass
+
+
+class IntMacroArgument(IntType, NbtIntType, NumericMacroArgument):
     """整数宏参数"""
 
     @property
     @override
     def expected_type(self) -> type[NbtType]:
         return NbtIntType
+
+
+class ForContext:
+
+    def __init__(self, function: Function, num: IntLike | Score, end: IntLike | Score | None = None, step: IntLike | Score = 1, path: tuple[str, ...] = (), macro_argument: MacroArgument | None = None):
+        if end is None:
+            end = num
+            num = 0
+
+        self.function: Function = function
+        self.start: IntLike | Score = num
+        self.end: IntLike | Score = end
+        self.step: IntLike | Score = step
+        self.path: tuple[str, ...] = path
+        self.macro_argument: MacroArgument | None = macro_argument
+        self.sub_function: Function | None = None
+        self.scb: Objective = self.function.local_scb()
+        self.index: Score = self.scb["__for_loop_index"]
+        self.total: Score = self.scb["__for_loop_total"]
+
+    def __enter__(self):
+        self.function.set(self.total, self.start)
+        self.function.set(self.index, 0)
+        if self.macro_argument is not None:
+            self.function.store("result", self.macro_argument).get(self.index)
+        self.sub_function = self.function.sub_function(*self.path).__enter__()
+        self.sub_function.if_(self.index, ">=", self.total).return_fail()
+        return self.sub_function
+
+    def __exit__(self, exc_type: type, exc_val: BaseException, exc_tb: TracebackType):
+        if self.sub_function is not None:
+            self.sub_function.add(self.index, self.step)
+            if self.macro_argument is not None:
+                self.sub_function.store("result", self.macro_argument).get(self.index)
+                self.sub_function.call_function(self.sub_function)
+            self.sub_function.__exit__(exc_type, exc_val, exc_tb)
 
 
 class Config:
@@ -1388,4 +1822,3 @@ PREDEFINED_ITEM_TYPES: dict[str, ItemType] = {
 PREDEFINED_SCOREBOARD_CRITERIA: dict[str, ScoreboardCriteria] = {
     "dummy": ScoreboardSingleCriteria("dummy"),
 }
-

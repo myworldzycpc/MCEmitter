@@ -2,3 +2,5 @@
 /test/
 /typings/
 /mc_emitter_moduled/
+__pycache__/
+*.pyc
