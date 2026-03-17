@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import typing
 from abc import ABC, abstractmethod
@@ -88,6 +89,10 @@ class NbtStringType(NbtType, ABC):
     type_name: str = "string"
 
 
+class NbtListType(NbtType, ABC):
+    type_name: str = "list"
+
+
 class NbtCompoundType(NbtType, ABC):
     type_name: str = "compound"
 
@@ -131,8 +136,8 @@ class NbtInt(NbtNumeric[int], NbtIntType):
 
 
 class NbtString(NbtBase, NbtStringType):
-    def __init__(self, value: str | DynamicString = ""):
-        self.value: str | DynamicString = value
+    def __init__(self, value: StringLike = ""):
+        self.value: StringLike = value
 
     @override
     def __str__(self):
@@ -141,7 +146,7 @@ class NbtString(NbtBase, NbtStringType):
     @property
     @override
     def is_dynamic(self) -> bool:
-        if isinstance(self.value, DynamicString):
+        if isinstance(self.value, Argument):
             if self.value.is_dynamic:
                 return True
 
@@ -153,6 +158,85 @@ class NbtString(NbtBase, NbtStringType):
         if isinstance(self.value, DynamicString):
             return self.value.macro_arguments
         return set()
+
+
+class NbtList(NbtBase, Generic[TBaseCovariant], NbtListType):
+    elements: list[TBaseCovariant]
+
+    def __init__(self, elements: list[TBaseCovariant]):
+        self.elements = elements
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return any(element.is_dynamic for element in self.elements)
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        # noinspection PyTypeChecker
+        return {macro_arg for element in self.elements for macro_arg in element.macro_arguments}
+
+    @override
+    def __str__(self):
+        return "[" + ", ".join(map(str, self.elements)) + "]"
+
+
+class NbtCompound(NbtBase, NbtCompoundType):
+    entries: dict[StringLike, NbtType]
+
+    def __init__(self, entries: dict[StringLike, NbtType]):
+        self.entries = entries
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return any((isinstance(key, Argument) and key.is_dynamic) or value.is_dynamic for key, value in self.entries.items())
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        macro_args: set[MacroArgument] = set()
+        for key, value in self.entries.items():
+            if isinstance(key, Argument):
+                macro_args.update(key.macro_arguments)
+            macro_args.update(value.macro_arguments)
+        return macro_args
+
+    @override
+    def __str__(self):
+        def _needs_quoting(key: StringLike):
+            """判断键是否需要被 JSON 转义（即是否应加引号）"""
+            if isinstance(key, Argument) and key.is_dynamic:
+                return True
+            # 检查键的字符串形式是否包含非法标识符字符
+            return not set(str(key)).issubset(Config.IDENTIFIER_ALLOWED)
+
+        def _format_key(key: StringLike):
+            """根据规则格式化键"""
+            if _needs_quoting(key):
+                return json.dumps(str(key))
+            return key
+
+        # 然后使用：
+        return "{" + ", ".join(f"{_format_key(key)}: {value}" for key, value in self.entries.items()) + "}"
+
+
+class TextComponent(NbtBase, ABC):
+    """文本组件"""
+    pass
+
+
+class LiteralTextComponent(TextComponent, NbtBase, ABC):
+    pass
+
+
+class StringLiteralTextComponent(LiteralTextComponent, NbtString):
+    pass
+
+
+class CompoundLiteralTextComponent(LiteralTextComponent, NbtCompound):
+    pass
 
 
 class DynamicString(StringType):
@@ -969,7 +1053,7 @@ class ScoreboardPlayersCommand(ScoreboardCommand, ABC):
         return super().parts + ["players"]
 
 
-class ScoreboardPlayersGetCommand(ScoreboardCommand):
+class ScoreboardPlayersGetCommand(ScoreboardPlayersCommand):
     score: Score
 
     def __init__(self, score: Score):
@@ -1193,6 +1277,7 @@ class Function(PathNamespacedId):
         self.opened = False
         self.modified_macro_arguments: set[MacroArgument] = set()
         self.create_from: Function | None = None
+        self.create_from_args: dict[MacroArgument, NbtType | Score] | None = None
         self.virtual: bool = virtual
         self.macro_arguments_in_commands: set[MacroArgument] = set()
 
@@ -1234,7 +1319,7 @@ class Function(PathNamespacedId):
     def __exit__(self, exc_type: type, exc_val: BaseException, exc_tb: TracebackType):
         self.opened = False
         if self.create_from:
-            self.create_from.call_function(self)
+            self.create_from.call_function(self, self.create_from_args)
 
     def _finalize_command(self, command: Command) -> Command:
         """最终化命令，处理execute上下文"""
@@ -1273,6 +1358,12 @@ class Function(PathNamespacedId):
             case _:
                 raise ValueError(f"Invalid target or value: {target}, {value}")
 
+    def set_args(self, args: dict[MacroArgument, NbtType | Score]):
+        if self.context_stack:
+            raise ValueError("Cannot set macro arguments in execute context")
+        for arg, value in args.items():
+            self.set(arg, value)
+
     def add(self, target: Score, value: IntLike | Score):
         match value:
             case int() | IntType():
@@ -1295,16 +1386,19 @@ class Function(PathNamespacedId):
             case DataPointer():
                 return self._finalize_command(DataGetCommand(target))
 
-    def call_function(self, function: Function, with_: DataPointer[NbtCompoundType] | DataHolder | None | Literal["auto"] = "auto", args: dict[MacroArgument, NbtType] | None = None) -> Command:
+    def call_function(self, function: Function, args: dict[MacroArgument, NbtType | Score] | None = None, with_: DataPointer[NbtCompoundType] | DataHolder | None | Literal["auto"] = "auto") -> Command:
         """创建调用函数的命令"""
+        if args is not None:
+            self.set_args(args)
         return self._finalize_command(FunctionCommand(function, with_))
 
-    def sub_function(self, *path: str, commands: list[Command] | None = None, limit_entities: None = None) -> "Function":
+    def sub_function(self, *path: str, commands: list[Command] | None = None, limit_entities: None = None, args: dict[MacroArgument, NbtType | Score] | None = None) -> "Function":
         """创建子函数调用命令"""
         if len(path) == 0:
             path = (f"_{Registries.FUNCTION_REGISTRY.get_auto_id(self)}",)
         function = self.create_child(*path, commands=commands, limit_entities=limit_entities)
         function.create_from = self
+        function.create_from_args = args
         return function
 
     def random_value(self, range: IntRange) -> Command:
@@ -2006,8 +2100,8 @@ class ForContext:
         self.total: Score = self.scb["__for_loop_total"]
 
     def __enter__(self):
-        self.function.set(self.total, self.start)
-        self.function.set(self.index, 0)
+        self.function.set(self.total, self.end)
+        self.function.set(self.index, self.start)
         if self.macro_argument is not None:
             self.function.store("result", self.macro_argument).get(self.index)
         self.sub_function = self.function.sub_function(*self.path).__enter__()
