@@ -41,8 +41,9 @@ class Creatable(ABC):
 
 
 class Serializable(ABC):
+    @property
     @abstractmethod
-    def to_nbt(self) -> NbtBase:
+    def nbt(self) -> NbtBase:
         pass
 
 
@@ -83,6 +84,10 @@ class NbtNumericIntegerType(NbtNumericType, ABC): pass
 
 class NbtIntType(NbtNumericIntegerType, ABC):
     type_name: str = "int"
+
+
+class NbtBoolType(NbtType, ABC):
+    type_name: str = "bool"
 
 
 class NbtStringType(NbtType, ABC):
@@ -135,13 +140,47 @@ class NbtInt(NbtNumeric[int], NbtIntType):
         return ""
 
 
+class NbtByte(NbtNumeric[int], NbtIntType):
+
+    @property
+    @override
+    def suffix(self) -> str:
+        return "b"
+
+
+class NbtBool(NbtBase, NbtBoolType):
+    value: bool
+
+    def __init__(self, value: bool):
+        super().__init__()
+        self.value = value
+
+    @override
+    def __str__(self):
+        return "true" if self.value else "false"
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return set()
+
+
 class NbtString(NbtBase, NbtStringType):
     def __init__(self, value: StringLike = ""):
         self.value: StringLike = value
 
     @override
     def __str__(self):
-        return repr(self.value)
+        json_str = json.dumps(self.value)
+        python_str = repr(self.value)
+        if len(python_str) < len(json_str):
+            return python_str
+        return json_str
 
     @property
     @override
@@ -160,10 +199,10 @@ class NbtString(NbtBase, NbtStringType):
         return set()
 
 
-class NbtList(NbtBase, Generic[TBaseCovariant], NbtListType):
-    elements: list[TBaseCovariant]
+class NbtList(NbtBase, Generic[TBase], NbtListType):
+    elements: list[TBase]
 
-    def __init__(self, elements: list[TBaseCovariant]):
+    def __init__(self, elements: list[TBase]):
         self.elements = elements
 
     @property
@@ -180,6 +219,28 @@ class NbtList(NbtBase, Generic[TBaseCovariant], NbtListType):
     @override
     def __str__(self):
         return "[" + ", ".join(map(str, self.elements)) + "]"
+
+    def __getitem__(self, item: int) -> TBase:
+        return self.elements[item]
+
+    def __setitem__(self, key: int, value: TBase):
+        self.elements[key] = value
+
+    def __delitem__(self, key: int):
+        del self.elements[key]
+
+    def __len__(self) -> int:
+        return len(self.elements)
+
+    def __contains__(self, item: TBase) -> bool:
+        return item in self.elements
+
+    def __add__(self, other: NbtList[TBase]) -> NbtList[TBase]:
+        return NbtList(self.elements + other.elements)
+
+    def __iadd__(self, other: NbtList[TBase]) -> NbtList[TBase]:
+        self.elements += other.elements
+        return self
 
 
 class NbtCompound(NbtBase, NbtCompoundType):
@@ -203,6 +264,30 @@ class NbtCompound(NbtBase, NbtCompoundType):
             macro_args.update(value.macro_arguments)
         return macro_args
 
+    def __getitem__(self, item: StringLike):
+        return self.entries[item]
+
+    def __setitem__(self, key: StringLike, value: NbtType):
+        self.entries[key] = value
+
+    def __delitem__(self, key: StringLike):
+        del self.entries[key]
+
+    def __or__(self, other: NbtCompound) -> NbtCompound:
+        """合并两个NBT Compound"""
+        return NbtCompound(self.entries | other.entries)
+
+    def __ior__(self, other: NbtCompound) -> NbtCompound:
+        """合并两个NBT Compound"""
+        self.entries |= other.entries
+        return self
+
+    def __contains__(self, item: StringLike) -> bool:
+        return item in self.entries
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
     @override
     def __str__(self):
         def _needs_quoting(key: StringLike):
@@ -222,21 +307,241 @@ class NbtCompound(NbtBase, NbtCompoundType):
         return "{" + ", ".join(f"{_format_key(key)}: {value}" for key, value in self.entries.items()) + "}"
 
 
-class TextComponent(NbtBase, ABC):
+class TextComponentSource(Serializable, ABC):
+    @property
+    @abstractmethod
+    @override
+    def nbt(self) -> NbtCompound:
+        pass
+
+
+class LiteralTextComponentSource(TextComponentSource):
+    text: StringLike
+
+    def __init__(self, text: StringLike):
+        self.text = text
+
+    @property
+    @override
+    def nbt(self) -> NbtCompound:
+        return NbtCompound({
+            "text": NbtString(self.text)
+        })
+
+
+class ScoreTextComponentSource(TextComponentSource):
+    score: Score
+
+    def __init__(self, score: Score):
+        self.score = score
+
+    @property
+    @override
+    def nbt(self) -> NbtCompound:
+        return NbtCompound({
+            "score": NbtCompound({
+                "name": NbtString(str(self.score.name)),
+                "objective": NbtString(self.score.objective.name)
+            })
+        })
+
+
+class TranslatableTextComponentSource(TextComponentSource):
+    translate: StringLike
+    fallback: StringLike | None
+    with_: list[TextComponent] | None
+
+    def __init__(self, translate: str, *with_: TextComponent, fallback: StringLike | None = None):
+        self.translate = translate
+        self.fallback = fallback
+        self.with_ = list(with_) if len(with_) > 0 else None
+
+    @property
+    @override
+    def nbt(self) -> NbtCompound:
+        compound = NbtCompound({
+            "translate": NbtString(self.translate),
+        })
+        if self.with_ is not None:
+            compound["with"] = NbtList([component.nbt for component in self.with_])
+        if self.fallback is not None:
+            compound["fallback"] = NbtString(self.fallback)
+        return compound
+
+
+class TextColor(Serializable, ABC):
+    """颜色基类"""
+    value: str
+
+    def __init__(self, value: str):
+        self.value = value
+
+    @property
+    @override
+    def nbt(self) -> NbtString:
+        return NbtString(self.value)
+
+
+class PredefinedTextColor(TextColor):
+    """预定义颜色"""
+    pass
+
+
+class HexTextColor(TextColor):
+    """十六进制颜色"""
+
+    def __init__(self, value: str | int | tuple[int, int, int]):
+        if isinstance(value, str):
+            if value.startswith("#"):
+                value = value[1:]
+            if len(value) != 6:
+                raise ValueError(f"Invalid hex color format: {value}. Expected format: #RRGGBB")
+        elif isinstance(value, int):
+            value = f"{value:06x}"
+        else:
+            r, g, b = value
+            value = f"{r:02x}{g:02x}{b:02x}"
+        super().__init__(f"#{value}")
+
+
+class TextComponent(Argument, Serializable):
     """文本组件"""
-    pass
 
+    source: TextComponentSource
+    color: TextColor | None
+    bold: bool | None
+    italic: bool | None
+    underlined: bool | None
+    strikethrough: bool | None
+    obfuscated: bool | None
+    extra: list[TextComponent] | None
 
-class LiteralTextComponent(TextComponent, NbtBase, ABC):
-    pass
+    def __init__(self, source: TextComponentSource, color: TextColor | None = None, bold: bool | None = None,
+                 italic: bool | None = None, underlined: bool | None = None, strikethrough: bool | None = None,
+                 obfuscated: bool | None = None, extra: list[TextComponent] | None = None):
+        self.source = source
+        self.color = color
+        self.bold = bold
+        self.italic = italic
+        self.underlined = underlined
+        self.strikethrough = strikethrough
+        self.obfuscated = obfuscated
+        self.extra = extra
 
+    @staticmethod
+    def literal(text: StringLike) -> TextComponent:
+        """创建文本组件，内容为文本"""
+        return TextComponent(LiteralTextComponentSource(text))
 
-class StringLiteralTextComponent(LiteralTextComponent, NbtString):
-    pass
+    @staticmethod
+    def score(score: Score) -> TextComponent:
+        """创建文本组件，内容为分数"""
+        return TextComponent(ScoreTextComponentSource(score))
 
+    @staticmethod
+    def translatable(translate: str, *with_: TextComponent, fallback: StringLike | None = None) -> TextComponent:
+        """创建文本组件，内容为可翻译文本"""
+        return TextComponent(TranslatableTextComponentSource(translate, *with_, fallback=fallback))
 
-class CompoundLiteralTextComponent(LiteralTextComponent, NbtCompound):
-    pass
+    @staticmethod
+    def empty() -> TextComponent:
+        """创建空文本组件"""
+        return TextComponent(LiteralTextComponentSource(""))
+
+    def with_color(self, color: TextColor | str | int | tuple[int, int, int]) -> TextComponent:
+        """设置颜色"""
+        if not isinstance(color, TextColor):
+            if isinstance(color, str):
+                color = PredefinedTextColor(color)
+            else:
+                color = HexTextColor(color)
+        self.color = color
+        return self
+
+    def set_bold(self, bold: bool = True) -> TextComponent:
+        """设置粗体"""
+        self.bold = bold
+        return self
+
+    def set_italic(self, italic: bool = True) -> TextComponent:
+        """设置斜体"""
+        self.italic = italic
+        return self
+
+    def set_underlined(self, underlined: bool = True) -> TextComponent:
+        """设置下划线"""
+        self.underlined = underlined
+        return self
+
+    def set_strikethrough(self, strikethrough: bool = True) -> TextComponent:
+        """设置删除线"""
+        self.strikethrough = strikethrough
+        return self
+
+    def set_obfuscated(self, obfuscated: bool = True) -> TextComponent:
+        """设置模糊"""
+        self.obfuscated = obfuscated
+        return self
+
+    def then(self, component: TextComponent):
+        """添加额外的文本组件"""
+        if self.extra is None:
+            self.extra = []
+        self.extra.append(component)
+        return self
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        if isinstance(self.source, Argument) and self.source.is_dynamic:
+            return True
+
+        return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.source, Argument):
+            return self.source.macro_arguments
+        return set()
+
+    @overload
+    def _nbt_no_extra(self, allow_string: Literal[True] = True) -> NbtString | NbtCompound:
+        ...
+
+    @overload
+    def _nbt_no_extra(self, allow_string: Literal[False]) -> NbtCompound:
+        ...
+
+    def _nbt_no_extra(self, allow_string: bool = True):
+        compound = self.source.nbt
+        if self.color is not None:
+            compound["color"] = self.color.nbt
+        if self.bold is not None:
+            compound["bold"] = NbtBool(self.bold)
+        if self.italic is not None:
+            compound["italic"] = NbtBool(self.italic)
+        if self.underlined is not None:
+            compound["underlined"] = NbtBool(self.underlined)
+        if self.strikethrough is not None:
+            compound["strikethrough"] = NbtBool(self.strikethrough)
+        if self.obfuscated is not None:
+            compound["obfuscated"] = NbtBool(self.obfuscated)
+        if allow_string and isinstance(self.source, LiteralTextComponentSource) and len(compound) == 1:
+            return NbtString(self.source.text)
+        return compound
+
+    @property
+    @override
+    def nbt(self, allow_list: bool = True, allow_string: bool = True) -> NbtBase:
+        if self.extra is not None:
+            if allow_list:
+                return NbtList([self._nbt_no_extra(), *[component.nbt for component in self.extra]])
+            compound = self._nbt_no_extra(allow_string=False)
+            compound["extra"] = NbtList([component.nbt for component in self.extra])
+            return compound
+        # noinspection PyTypeChecker
+        return self._nbt_no_extra(allow_string=allow_string)
 
 
 class DynamicString(StringType):
@@ -311,8 +616,8 @@ class Namespace:
     def path_namespace_id(self, path: tuple[str | DynamicString, ...]):
         return PathNamespacedId(self, path)
 
-    def function(self, path: tuple[str, ...], commands: list[Command] | None = None, limit_entities: None = None):
-        return Function(self.path_namespace_id(path), commands=commands, limit_entities=limit_entities)
+    def function(self, path: tuple[str, ...], commands: list[Command] | None = None, limit_entities: None = None, doc: FunctionDoc | str | None = None):
+        return Function(self.path_namespace_id(path), commands=commands, limit_entities=limit_entities, doc=doc)
 
 
 class NamespacedId(Argument):
@@ -796,6 +1101,15 @@ class CommentCommand(Command):
         return ["#"] + list(self.args)
 
 
+class DocCommentCommand(CommentCommand):
+    """文档注释命令"""
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["###"] + list(self.args)
+
+
 class BlankCommand(Command):
     @property
     @override
@@ -815,6 +1129,15 @@ class SayCommand(Command):
     @override
     def parts(self) -> list[CommandPartCompatible]:
         return ["say"] + list(self.args)
+
+
+class ListCommand(Command):
+    """list命令"""
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["list"]
 
 
 class ExecuteSubCommand(CommandBase, ABC):
@@ -1262,24 +1585,33 @@ class ReturnValueCommand(ReturnCommand):
         return super().parts + [self.value]
 
 
+class FunctionDoc:
+    """函数文档"""
+    description: str
+
+    def __init__(self, description: str):
+        self.description = description
+
+
 class Function(PathNamespacedId):
     """函数类，负责管理一组命令"""
     opened: bool
     limit_entities: None
 
-    def __init__(self, namespaced_id: PathNamespacedId, commands: list[Command] | None = None, limit_entities: None = None, virtual: bool = False):
+    def __init__(self, namespaced_id: PathNamespacedId, commands: list[Command] | None = None, limit_entities: None = None, virtual: bool = False, doc: FunctionDoc | str | None = None):
         if not virtual and namespaced_id.is_dynamic:
             raise ValueError("Dynamic namespaced ID is not allowed for function")
         super().__init__(namespaced_id.namespace, namespaced_id.path)
         self.is_macro: bool = False
         self.commands: list[Command] = []
         self.limit_entities = limit_entities  # TODO: 限制实体参数
-        self.opened = False
+        self.opened = True
         self.modified_macro_arguments: set[MacroArgument] = set()
         self.create_from: Function | None = None
         self.create_from_args: dict[MacroArgument, NbtType | Score] | None = None
         self.virtual: bool = virtual
         self.macro_arguments_in_commands: set[MacroArgument] = set()
+        self.doc: FunctionDoc | None = FunctionDoc(doc) if isinstance(doc, str) else doc
 
         # 当前命令上下文参数
         self.context_stack: list[ExecuteSubCommand] = []
@@ -1287,6 +1619,16 @@ class Function(PathNamespacedId):
         # 注册函数
         if not self.virtual:
             Registries.FUNCTION_REGISTRY.register_function(self)
+
+        has_doc_comment = False
+        if self.doc is not None:
+            self.doc_comment(self.doc.description)
+            has_doc_comment = True
+        if Config.GENERATED_FUNCTION_FILE_HEADER is not None:
+            self.doc_comment(Config.GENERATED_FUNCTION_FILE_HEADER)
+            has_doc_comment = True
+        if has_doc_comment:
+            self.blank()
 
         # 添加并处理命令
         if commands:
@@ -1307,10 +1649,12 @@ class Function(PathNamespacedId):
         for cmd in commands:
             self.add_command(cmd)
 
-    def create_child(self, *child_path: str, commands: list[Command] | None = None, limit_entities: None = None) -> "Function":
+    def create_child(self, *child_path: str, commands: list[Command] | None = None, limit_entities: None = None, virtual: bool = False, doc: FunctionDoc | str | None = None) -> "Function":
         """创建子函数"""
+        if len(child_path) == 0:
+            child_path = (f"_{Registries.FUNCTION_REGISTRY.get_auto_id(self)}",)
         full_path = self + child_path
-        return Function(namespaced_id=full_path, commands=commands, limit_entities=limit_entities)
+        return Function(namespaced_id=full_path, commands=commands, limit_entities=limit_entities, virtual=virtual, doc=doc)
 
     def __enter__(self):
         self.opened = True
@@ -1392,11 +1736,9 @@ class Function(PathNamespacedId):
             self.set_args(args)
         return self._finalize_command(FunctionCommand(function, with_))
 
-    def sub_function(self, *path: str, commands: list[Command] | None = None, limit_entities: None = None, args: dict[MacroArgument, NbtType | Score] | None = None) -> "Function":
+    def sub_function(self, *path: str, commands: list[Command] | None = None, limit_entities: None = None, args: dict[MacroArgument, NbtType | Score] | None = None, virtual: bool = False, doc: FunctionDoc | str | None = None) -> "Function":
         """创建子函数调用命令"""
-        if len(path) == 0:
-            path = (f"_{Registries.FUNCTION_REGISTRY.get_auto_id(self)}",)
-        function = self.create_child(*path, commands=commands, limit_entities=limit_entities)
+        function = self.create_child(*path, commands=commands, limit_entities=limit_entities, virtual=virtual, doc=doc)
         function.create_from = self
         function.create_from_args = args
         return function
@@ -1408,6 +1750,10 @@ class Function(PathNamespacedId):
     def comment(self, *args: CommandPartCompatible) -> Command:
         """创建注释命令"""
         return self._finalize_command(CommentCommand(*args))
+
+    def doc_comment(self, *args: CommandPartCompatible) -> Command:
+        """创建文档注释命令"""
+        return self._finalize_command(DocCommentCommand(*args))
 
     def blank(self):
         """创建空行"""
@@ -1426,6 +1772,9 @@ class Function(PathNamespacedId):
     def return_value(self, value: IntLike = 0) -> Command:
         """创建返回值命令"""
         return self._finalize_command(ReturnValueCommand(value))
+
+    def list_players(self):
+        return self._finalize_command(ListCommand())
 
     # add commands here ...
 
@@ -2124,6 +2473,7 @@ class Config:
     ARGUMENT_STORAGE: Storage = Storage(DEFAULT_NAMESPACE, "args")
     OUTPUT_DIR: str = "../output/"
     IDENTIFIER_ALLOWED: set[str] = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+    GENERATED_FUNCTION_FILE_HEADER: str | None = "⚠️该文件由程序生成，不应手动修改生成的文件，因为重新生成时，更改将丢失。"
 
 
 # 预定义的方块和物品类型
@@ -2142,4 +2492,19 @@ PREDEFINED_ITEM_TYPES: dict[str, ItemType] = {
 
 PREDEFINED_SCOREBOARD_CRITERIA: dict[str, ScoreboardCriteria] = {
     "dummy": ScoreboardSingleCriteria("dummy"),
+}
+
+PREDEFINED_TEXT_COLORS: dict[str, TextColor] = {
+    "red": PredefinedTextColor("red"),
+    "blue": PredefinedTextColor("blue"),
+    "green": PredefinedTextColor("green"),
+    "aqua": PredefinedTextColor("aqua"),
+    "gold": PredefinedTextColor("gold"),
+    "yellow": PredefinedTextColor("yellow"),
+    "white": PredefinedTextColor("white"),
+    "gray": PredefinedTextColor("gray"),
+    "light_purple": PredefinedTextColor("light_purple"),
+    "dark_purple": PredefinedTextColor("dark_purple"),
+    "black": PredefinedTextColor("black"),
+    "dark_green": PredefinedTextColor("dark_green"),
 }
