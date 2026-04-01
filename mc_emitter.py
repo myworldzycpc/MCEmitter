@@ -8,16 +8,7 @@ from collections import defaultdict
 from enum import Enum
 from string.templatelib import Template, Interpolation
 from types import TracebackType
-from typing import Self, Generic, override, overload, Literal, TypeVar
-
-T = TypeVar('T')
-TCovariant = TypeVar('TCovariant', covariant=True)
-T2 = TypeVar('T2')
-K = TypeVar('K')
-TCreatable = TypeVar('TCreatable', bound="Creatable")
-TBaseCovariant = TypeVar('TBaseCovariant', bound="NbtType", covariant=True)
-TNumericCovariant = TypeVar('TNumericCovariant', bound="NbtNumericType", covariant=True)
-TBase = TypeVar('TBase', bound="NbtType")
+from typing import Self, override, overload, Literal
 
 type CommandPartCompatible = str | Argument | int | float | bool
 type IntLike = int | IntType
@@ -86,6 +77,14 @@ class NbtIntType(NbtNumericIntegerType, ABC):
     type_name: str = "int"
 
 
+class NbtByteType(NbtNumericIntegerType, ABC):
+    type_name: str = "byte"
+
+
+class NbtFloatType(NbtNumericType, ABC):
+    type_name: str = "float"
+
+
 class NbtBoolType(NbtType, ABC):
     type_name: str = "bool"
 
@@ -107,7 +106,7 @@ class NbtBase(NbtType, ABC):
     pass
 
 
-class NbtNumeric(NbtBase, NbtNumericType, Generic[T], ABC):
+class NbtNumeric[T](NbtBase, NbtNumericType, ABC):
     def __init__(self, value: T):
         super().__init__()
         self.value: T = value
@@ -132,7 +131,7 @@ class NbtNumeric(NbtBase, NbtNumericType, Generic[T], ABC):
         return set()
 
 
-class NbtInt(NbtNumeric[int], NbtIntType):
+class NbtInt(NbtNumeric[IntLike], NbtIntType):
 
     @property
     @override
@@ -140,12 +139,19 @@ class NbtInt(NbtNumeric[int], NbtIntType):
         return ""
 
 
-class NbtByte(NbtNumeric[int], NbtIntType):
+class NbtByte(NbtNumeric[IntLike], NbtByteType):
 
     @property
     @override
     def suffix(self) -> str:
         return "b"
+
+
+class NbtFloat(NbtNumeric[FloatLike], NbtFloatType):
+    @property
+    @override
+    def suffix(self) -> str:
+        return "f"
 
 
 class NbtBool(NbtBase, NbtBoolType):
@@ -199,10 +205,10 @@ class NbtString(NbtBase, NbtStringType):
         return set()
 
 
-class NbtList(NbtBase, Generic[TBase], NbtListType):
-    elements: list[TBase]
+class NbtList[T: NbtType](NbtBase, NbtListType):
+    elements: list[T]
 
-    def __init__(self, elements: list[TBase]):
+    def __init__(self, elements: list[T]):
         self.elements = elements
 
     @property
@@ -220,10 +226,10 @@ class NbtList(NbtBase, Generic[TBase], NbtListType):
     def __str__(self):
         return "[" + ", ".join(map(str, self.elements)) + "]"
 
-    def __getitem__(self, item: int) -> TBase:
+    def __getitem__(self, item: int) -> T:
         return self.elements[item]
 
-    def __setitem__(self, key: int, value: TBase):
+    def __setitem__(self, key: int, value: T):
         self.elements[key] = value
 
     def __delitem__(self, key: int):
@@ -232,13 +238,13 @@ class NbtList(NbtBase, Generic[TBase], NbtListType):
     def __len__(self) -> int:
         return len(self.elements)
 
-    def __contains__(self, item: TBase) -> bool:
+    def __contains__(self, item: T) -> bool:
         return item in self.elements
 
-    def __add__(self, other: NbtList[TBase]) -> NbtList[TBase]:
+    def __add__(self, other: NbtList[T]) -> NbtList[T]:
         return NbtList(self.elements + other.elements)
 
-    def __iadd__(self, other: NbtList[TBase]) -> NbtList[TBase]:
+    def __iadd__(self, other: NbtList[T]) -> NbtList[T]:
         self.elements += other.elements
         return self
 
@@ -246,8 +252,8 @@ class NbtList(NbtBase, Generic[TBase], NbtListType):
 class NbtCompound(NbtBase, NbtCompoundType):
     entries: dict[StringLike, NbtType]
 
-    def __init__(self, entries: dict[StringLike, NbtType]):
-        self.entries = entries
+    def __init__(self, entries: dict[StringLike, NbtType] | None = None):
+        self.entries = entries or {}
 
     @property
     @override
@@ -544,6 +550,226 @@ class TextComponent(Argument, Serializable):
         return self._nbt_no_extra(allow_string=allow_string)
 
 
+class Vector(Argument, Serializable, ABC):
+    """所有向量的基类，坐标存储为元组"""
+
+    coordinates: tuple[NumericLike, ...]
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return any(isinstance(coord, Argument) and coord.is_dynamic for coord in self.coordinates)
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        s: set[MacroArgument] = set()
+        for coord in self.coordinates:
+            if isinstance(coord, Argument):
+                s.update(coord.macro_arguments)
+        return s
+
+    @property
+    @override
+    def nbt(self) -> NbtList[NbtNumericType]:
+        l: list[NbtNumericType] = []
+        for coord in self.coordinates:
+            if isinstance(coord, int | IntType):
+                l.append(NbtInt(coord))
+            else:
+                l.append(NbtFloat(coord))
+        return NbtList(l)
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, type(self)):
+            return False
+        return self.coordinates == other.coordinates
+
+    @override
+    def __hash__(self):
+        return hash(self.coordinates)
+
+
+class Vec3(Vector):
+    coordinates: tuple[NumericLike, NumericLike, NumericLike]
+
+    def __init__(self, x: NumericLike, y: NumericLike, z: NumericLike):
+        self.coordinates = (x, y, z)
+
+
+class Vec2(Vector):
+    coordinates: tuple[NumericLike, NumericLike]
+
+    def __init__(self, x: NumericLike, y: NumericLike):
+        self.coordinates = (x, y)
+
+
+class Coordinates(Argument, ABC):
+    """坐标基类"""
+    vec3: Vec3
+
+    def __init__(self, vec3: Vec3):
+        self.vec3 = vec3
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return self.vec3.is_dynamic
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return self.vec3.macro_arguments
+
+    @abstractmethod
+    @override
+    def __eq__(self, other: object) -> bool:
+        pass
+
+
+class WorldCoordinates(Coordinates):
+    """世界坐标"""
+    relative_flags: tuple[bool, bool, bool]
+
+    def __init__(self, vec3: Vec3, relative_flags: tuple[bool, bool, bool] = (False, False, False)):
+        super().__init__(vec3)
+        self.relative_flags = relative_flags
+
+    @override
+    def __str__(self):
+        s_list: list[str] = []
+        for coord, flag in zip(self.vec3.coordinates, self.relative_flags):
+            if flag:
+                s_list.append(f"~{coord or ''}")
+            else:
+                s_list.append(str(coord))
+        return ' '.join(s_list)
+
+    @classmethod
+    def here(cls) -> WorldCoordinates:
+        """创建当前位置坐标"""
+        return cls(Vec3(0, 0, 0), relative_flags=(True, True, True))
+
+    @classmethod
+    def origin(cls) -> WorldCoordinates:
+        """创建原点坐标"""
+        return cls(Vec3(0, 0, 0))
+
+    @classmethod
+    def relative(cls, x: NumericLike, y: NumericLike, z: NumericLike) -> WorldCoordinates:
+        """创建相对坐标"""
+        return cls(Vec3(x, y, z), relative_flags=(True, True, True))
+
+    @classmethod
+    def absolute(cls, x: NumericLike, y: NumericLike, z: NumericLike) -> WorldCoordinates:
+        return cls(Vec3(x, y, z))
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, WorldCoordinates):
+            return False
+        return self.vec3 == other.vec3 and self.relative_flags == other.relative_flags
+
+
+class LocalCoordinates(Coordinates):
+    """局部坐标"""
+
+    @overload
+    def __init__(self, x: NumericLike, y: NumericLike, z: NumericLike, /) -> None:
+        ...
+
+    @overload
+    def __init__(self, vec3: Vec3, /) -> None:
+        ...
+
+    def __init__(self, *args: NumericLike | Vec3):
+        match args:
+            case (Vec3() as vec3, ):
+                super().__init__(vec3)
+            case (x, y, z):
+                x = typing.cast(NumericLike, x)
+                y = typing.cast(NumericLike, y)
+                z = typing.cast(NumericLike, z)
+                super().__init__(Vec3(x, y, z))
+            case _:
+                raise ValueError(f"Invalid arguments for LocalCoordinates: {args}")
+
+    @override
+    def __str__(self):
+        return " ".join(f"^{coord or ''}" for coord in self.vec3.coordinates)
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, LocalCoordinates):
+            return False
+        return self.vec3 == other.vec3
+
+    @classmethod
+    def here(cls) -> LocalCoordinates:
+        """创建当前位置坐标"""
+        return cls(0, 0, 0)
+
+    @classmethod
+    def offset(cls, x: NumericLike, y: NumericLike, z: NumericLike) -> LocalCoordinates:
+        return cls(x, y, z)
+
+
+class Rotation(Argument):
+    """旋转"""
+    vec2: Vec2
+    relative_flags: tuple[bool, bool]
+
+    def __init__(self, vec2: Vec2, relative_flags: tuple[bool, bool] = (False, False)):
+        self.vec2 = vec2
+        self.relative_flags = relative_flags
+
+    @override
+    def __str__(self):
+        s_list: list[str] = []
+        for coord, flag in zip(self.vec2.coordinates, self.relative_flags):
+            if flag:
+                s_list.append(f"~{coord or ''}")
+            else:
+                s_list.append(str(coord))
+        return ' '.join(s_list)
+
+    @classmethod
+    def here(cls) -> Self:
+        """创建当前旋转"""
+        return cls(Vec2(0, 0), relative_flags=(True, True))
+
+    @classmethod
+    def origin(cls) -> Self:
+        """创建原点旋转"""
+        return cls(Vec2(0, 0))
+
+    @classmethod
+    def relative(cls, x: NumericLike, y: NumericLike) -> Self:
+        """创建相对坐标"""
+        return cls(Vec2(x, y), relative_flags=(True, True))
+
+    @classmethod
+    def absolute(cls, x: NumericLike, y: NumericLike) -> Self:
+        return cls(Vec2(x, y))
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Rotation):
+            return False
+        return self.vec2 == other.vec2 and self.relative_flags == other.relative_flags
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return self.vec2.is_dynamic
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return self.vec2.macro_arguments
+
+
 class DynamicString(StringType):
     symbols: tuple[str | MacroArgument, ...]
 
@@ -725,7 +951,7 @@ class PathNamespacedId(NamespacedId):
 # ==============================
 
 
-class Registry(Generic[K, T]):
+class Registry[K, T]:
     """通用注册表基类"""
     name: str
 
@@ -862,6 +1088,11 @@ class BlockType(NamespacedId):
 
 class ItemType(NamespacedId):
     """物品类型，基于命名空间ID"""
+    pass
+
+
+class EntityType(NamespacedId):
+    """实体类型，基于命名空间ID"""
     pass
 
 
@@ -1008,12 +1239,12 @@ class Storage(NamespacedId, DataHolder):
         return ["storage", self]
 
 
-class DataPointer(Argument, Generic[TBaseCovariant], ABC):
+class DataPointer[T: NbtType](Argument, ABC):
     """数据指针基类"""
     path: Path
-    data_type: type[TBaseCovariant]
+    data_type: type[T]
 
-    def __init__(self, path: Path, data_type: type[TBaseCovariant]):
+    def __init__(self, path: Path, data_type: type[T]):
         super().__init__()
         self.path = path
         self.data_type = data_type
@@ -1023,12 +1254,12 @@ class DataPointer(Argument, Generic[TBaseCovariant], ABC):
         pass
 
 
-class StorageDataPointer(DataPointer[TBaseCovariant], Generic[TBaseCovariant]):
+class StorageDataPointer[T: NbtType](DataPointer[T]):
     """存储数据指针"""
 
     storage: Storage
 
-    def __init__(self, storage: Storage, path: Path, data_type: type[TBaseCovariant]):
+    def __init__(self, storage: Storage, path: Path, data_type: type[T]):
         super().__init__(path, data_type)
         self.storage = storage
 
@@ -1049,6 +1280,58 @@ class StorageDataPointer(DataPointer[TBaseCovariant], Generic[TBaseCovariant]):
     @override
     def macro_arguments(self) -> set[MacroArgument]:
         return self.storage.macro_arguments | self.path.macro_arguments
+
+
+class Entity(Serializable, ABC):
+
+    def __init__(self, tags: set[Tag] | None = None):
+        self.tags: set[Tag] = tags or set()
+
+    @property
+    @abstractmethod
+    def id(self) -> EntityType:
+        pass
+
+    @property
+    @override
+    def nbt(self) -> NbtCompound:
+        compound: NbtCompound = NbtCompound()
+        if self.tags:
+            compound["Tags"] = NbtList([NbtString(tag.name) for tag in self.tags])
+        return compound
+
+    @property
+    def has_extra_data(self) -> bool:
+        return len(self.nbt.entries) > 0
+
+
+class MarkerEntity(Entity):
+
+    @property
+    @override
+    def id(self) -> EntityType:
+        return EntityType.with_default_namespace("marker")
+
+
+class Anchor(Argument):
+    name: str
+
+    def __init__(self, name: str):
+        self.name = name
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        return set()
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        return False
+
+    @override
+    def __str__(self) -> str:
+        return self.name
 
 
 class CommandBase(ABC):
@@ -1265,12 +1548,12 @@ class ExecuteStoreScoreSubCommand(ExecuteStoreSubCommand):
         return super().parts + ["score", self.score]
 
 
-class ExecuteStoreDataSubCommand(ExecuteStoreSubCommand, Generic[TNumericCovariant]):
-    data_pointer: DataPointer[TNumericCovariant]
-    data_type: type[TNumericCovariant]
+class ExecuteStoreDataSubCommand[T: NbtNumericType](ExecuteStoreSubCommand):
+    data_pointer: DataPointer[T]
+    data_type: type[T]
     scale: NumericLike
 
-    def __init__(self, type: Literal["result", "success"], data_pointer: DataPointer[TNumericCovariant], scale: NumericLike = 1):
+    def __init__(self, type: Literal["result", "success"], data_pointer: DataPointer[T], scale: NumericLike = 1):
         super().__init__(type)
         self.data_pointer = data_pointer
         self.data_type = data_pointer.data_type
@@ -1280,6 +1563,19 @@ class ExecuteStoreDataSubCommand(ExecuteStoreSubCommand, Generic[TNumericCovaria
     @override
     def parts(self) -> list[CommandPartCompatible]:
         return super().parts + self.data_pointer.full_parts() + [self.data_type.type_name, self.scale]
+
+
+class ExecuteAnchoredSubCommand(ExecuteSubCommand):
+    anchor: Anchor
+
+    def __init__(self, anchor: Anchor):
+        super().__init__()
+        self.anchor = anchor
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        return ["anchored", self.anchor]
 
 
 class ExecuteCommand(Command):
@@ -1448,11 +1744,11 @@ class DataCommand(Command, ABC):
         return ["data"]
 
 
-class DataGetCommand(DataCommand, Generic[TBaseCovariant]):
+class DataGetCommand[T: NbtType](DataCommand):
 
-    def __init__(self, data_pointer: DataPointer[TBaseCovariant]):
+    def __init__(self, data_pointer: DataPointer[T]):
         super().__init__()
-        self.data_pointer: DataPointer[TBaseCovariant] = data_pointer
+        self.data_pointer: DataPointer[T] = data_pointer
 
     @property
     @override
@@ -1460,11 +1756,11 @@ class DataGetCommand(DataCommand, Generic[TBaseCovariant]):
         return super().parts + ["get"] + self.data_pointer.full_parts()
 
 
-class DataModifyCommand(DataCommand, Generic[TBaseCovariant], ABC):
+class DataModifyCommand[T: NbtType](DataCommand, ABC):
 
-    def __init__(self, data_pointer: DataPointer[TBaseCovariant]):
+    def __init__(self, data_pointer: DataPointer[T]):
         super().__init__()
-        self.data_pointer: DataPointer[TBaseCovariant] = data_pointer
+        self.data_pointer: DataPointer[T] = data_pointer
 
     @property
     @override
@@ -1473,7 +1769,7 @@ class DataModifyCommand(DataCommand, Generic[TBaseCovariant], ABC):
         return super().parts + ["modify"] + self.data_pointer.full_parts()
 
 
-class DataModifySetCommand(DataModifyCommand[TBaseCovariant], Generic[TBaseCovariant], ABC):
+class DataModifySetCommand[T: NbtType](DataModifyCommand[T], ABC):
     """data modify ... set命令"""
 
     @property
@@ -1483,10 +1779,10 @@ class DataModifySetCommand(DataModifyCommand[TBaseCovariant], Generic[TBaseCovar
         return super().parts + ["set"]
 
 
-class DataModifySetValueCommand(DataModifySetCommand[TBaseCovariant], Generic[TBaseCovariant]):
-    value: TBaseCovariant
+class DataModifySetValueCommand[T: NbtType](DataModifySetCommand[T]):
+    value: T
 
-    def __init__(self, data_pointer: DataPointer[TBaseCovariant], value: TBaseCovariant):
+    def __init__(self, data_pointer: DataPointer[T], value: T):
         super().__init__(data_pointer)
         self.value = value
 
@@ -1585,6 +1881,93 @@ class ReturnValueCommand(ReturnCommand):
         return super().parts + [self.value]
 
 
+class SummonCommand(Command):
+    entity: Entity
+    pos: Coordinates
+
+    def __init__(self, entity: Entity, pos: Coordinates | None = None):
+        super().__init__()
+        self.entity = entity
+        self.pos = pos or WorldCoordinates.here()
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        if self.entity.has_extra_data:
+            return ["summon", self.entity.id, self.pos, self.entity.nbt]
+        if self.pos != WorldCoordinates.here():
+            return ["summon", self.entity.id, self.pos]
+        return ["summon", self.entity.id]
+
+
+class KillCommand(Command):
+    selector: Selector
+
+    def __init__(self, selector: Selector | None = None):
+        super().__init__()
+        self.selector = selector or SelfSelector()
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        if self.selector == SelfSelector():
+            return ["kill"]
+        return ["kill", self.selector]
+
+
+class TpCommand(Command, ABC):
+    selector: Selector | SelfSelector
+
+    def __init__(self, selector: Selector | None = None):
+        super().__init__()
+        self.selector = selector or SelfSelector()
+
+
+class TpPosCommand(TpCommand):
+    pos: Coordinates
+    rotation: Rotation | None
+
+    def __init__(self, selector: Selector | None = None, pos: Coordinates | None = None, rotation: Rotation | None = None):
+        super().__init__(selector)
+        self.pos = pos or WorldCoordinates.here()
+        self.rotation = rotation
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        """
+        支持的语法：
+        tp <selector> <pos> [<rotation>]
+        tp <pos>
+        """
+        if self.selector == SelfSelector():
+            if self.rotation is None:
+                return ["tp", self.pos]
+        if self.rotation is None:
+            return ["tp", self.selector, self.pos]
+        return ["tp", self.selector, self.pos, self.rotation]
+
+
+class TpEntityCommand(TpCommand):
+    entity: SingleSelector
+
+    def __init__(self, entity: SingleSelector, selector: Selector | None = None):
+        super().__init__(selector)
+        self.entity = entity
+
+    @property
+    @override
+    def parts(self) -> list[CommandPartCompatible]:
+        """
+        支持的语法：
+        tp <selector> <entity>
+        tp <entity>
+        """
+        if self.selector == SelfSelector():
+            return ["tp", self.entity]
+        return ["tp", self.selector, self.entity]
+
+
 class FunctionDoc:
     """函数文档"""
     description: str
@@ -1673,11 +2056,15 @@ class Function(PathNamespacedId):
         self.add_command(command)
         return command
 
+    def assert_no_context(self):
+        if len(self.context_stack) > 0:
+            raise ValueError("Cannot use multi-command operation in execute context")
+
     def say(self, *args: CommandPartCompatible) -> Command:
         """创建say命令"""
         return self._finalize_command(SayCommand(*args))
 
-    def create(self, obj: TCreatable) -> 'TCreatable':
+    def create[T: Creatable](self, obj: T) -> 'T':
         self._finalize_command(obj.create_command())
         return obj
 
@@ -1688,8 +2075,7 @@ class Function(PathNamespacedId):
             case Score(), Score():
                 return self._finalize_command(ScoreboardPlayersOperationCommand(target, "=", value))
             case Score(), ScoreOperation():
-                if len(self.context_stack) > 0:
-                    raise ValueError("Cannot use multi-command operation in execute context")
+                self.assert_no_context()
                 self._finalize_command(ScoreboardPlayersOperationCommand(target, "=", value.score))
                 return self._finalize_command(ScoreboardPlayersOperationCommand(target, value.assignment_op, value.score2))
             case MacroArgument(), NbtType():
@@ -1703,8 +2089,7 @@ class Function(PathNamespacedId):
                 raise ValueError(f"Invalid target or value: {target}, {value}")
 
     def set_args(self, args: dict[MacroArgument, NbtType | Score]):
-        if self.context_stack:
-            raise ValueError("Cannot set macro arguments in execute context")
+        self.assert_no_context()
         for arg, value in args.items():
             self.set(arg, value)
 
@@ -1760,10 +2145,15 @@ class Function(PathNamespacedId):
         return self._finalize_command(BlankCommand())
 
     def tag_add(self, tag: Tag, selector: Selector | None = None):
-        return self._finalize_command(TagAddCommand(selector or Selector.self(), tag))
+        return self._finalize_command(TagAddCommand(selector or SelfSelector(), tag))
 
     def tag_remove(self, tag: Tag, selector: Selector | None = None):
-        return self._finalize_command(TagRemoveCommand(selector or Selector.self(), tag))
+        return self._finalize_command(TagRemoveCommand(selector or SelfSelector(), tag))
+
+    def tag_assign(self, tag: Tag, selector: Selector | None = None):
+        self.assert_no_context()
+        self.tag_remove(tag, Selector())
+        self.tag_add(tag, selector or SelfSelector())
 
     def return_fail(self) -> Command:
         """创建返回失败命令"""
@@ -1775,6 +2165,54 @@ class Function(PathNamespacedId):
 
     def list_players(self):
         return self._finalize_command(ListCommand())
+
+    def summon(self, entity: Entity, pos: Coordinates | None = None):
+        return self._finalize_command(SummonCommand(entity, pos))
+
+    def kill(self, selector: Selector):
+        return self._finalize_command(KillCommand(selector))
+
+    @overload
+    def tp(self, selector: Selector | SelfSelector, pos: Coordinates, rotation: Rotation, /) -> Command:
+        ...
+
+    @overload
+    def tp(self, selector: Selector | SelfSelector, pos: Coordinates, /) -> Command:
+        ...
+
+    @overload
+    def tp(self, selector: Selector | SelfSelector, entity: SingleSelector, /) -> Command:
+        ...
+
+    @overload
+    def tp(self, pos: Coordinates, rotation: Rotation, /) -> Command:
+        ...
+
+    @overload
+    def tp(self, pos: Coordinates, /) -> Command:
+        ...
+
+    @overload
+    def tp(self, entity: SingleSelector, /) -> Command:
+        ...
+
+    def tp(self, *args: object):
+        """创建tp命令"""
+        match args:
+            case (Selector() | SelfSelector() as selector, Coordinates() as pos, Rotation() as rotation):
+                return self._finalize_command(TpPosCommand(selector, pos, rotation))
+            case (Selector() | SelfSelector() as selector, Coordinates() as pos):
+                return self._finalize_command(TpPosCommand(selector, pos))
+            case (Selector() | SelfSelector() as selector, SingleSelector() as entity):
+                return self._finalize_command(TpEntityCommand(entity, selector))
+            case (Coordinates() as pos, Rotation() as rotation):
+                return self._finalize_command(TpPosCommand(None, pos, rotation))
+            case (Coordinates() as pos, ):
+                return self._finalize_command(TpPosCommand(None, pos))
+            case (SingleSelector() as entity, ):
+                return self._finalize_command(TpEntityCommand(entity))
+            case _:
+                raise ValueError(f"Invalid arguments: {args}")
 
     # add commands here ...
 
@@ -1793,7 +2231,7 @@ class Function(PathNamespacedId):
 
     def ast(self, selector: Selector) -> "Function":
         """同时添加as和at修饰符（替代原ast方法，更易理解）"""
-        return self.as_(selector).at(Selector.self())
+        return self.as_(selector).at(SelfSelector())
 
     @overload
     def if_(self, score: Score, start: IntLike, end: IntLike, reverse: bool = False, /) -> "Function":
@@ -1884,11 +2322,14 @@ class Function(PathNamespacedId):
             case _:
                 raise NotImplementedError("Unsupported target for store command")
 
+    def anchored(self, anchor: Anchor):
+        return self._add_execute_sub_command(ExecuteAnchoredSubCommand(anchor))
+
     def local_scb(self):
         return Registries.OBJECTIVE_REGISTRY.create_or_get(".".join(("zzz", *map(str, self.path))))
 
-    def for_loop(self, num: IntLike | Score, end: IntLike | Score | None = None, step: IntLike | Score = 1, path: tuple[str, ...] = (), macro_argument: MacroArgument | None = None):
-        return ForContext(self, num, end, step, path, macro_argument)
+    def for_loop(self, num: IntLike | Score, end: IntLike | Score | None = None, step: IntLike | Score = 1, path: tuple[str, ...] = (), macro_argument: MacroArgument | None = None, doc: FunctionDoc | str | None = None):
+        return ForContext(self, num, end, step, path, macro_argument, doc=doc)
 
 
 class SelectorVariable(Enum):
@@ -1916,8 +2357,28 @@ class SelectorArgument(ABC):
 
     @property
     @abstractmethod
+    def value_str(self) -> str:
+        pass
+
+    @property
+    @abstractmethod
     def macro_arguments(self) -> set[MacroArgument]:
         pass
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.name}={self.value_str}"
+
+    @override
+    def __eq__(self, other: object):
+        if not isinstance(other, SelectorArgument):
+            return False
+        else:
+            return str(self) == str(other)
+
+    @override
+    def __hash__(self):
+        return hash(str(self))
 
 
 class SelectorArgumentReversible(SelectorArgument, ABC):
@@ -1926,6 +2387,18 @@ class SelectorArgumentReversible(SelectorArgument, ABC):
 
     def __init__(self, reverse: bool = False):
         self.reverse = reverse
+
+    @property
+    @override
+    def value_str(self) -> str:
+        if self.reverse:
+            return f"!{self.value_str_without_reverse}"
+        return self.value_str_without_reverse
+
+    @property
+    @abstractmethod
+    def value_str_without_reverse(self) -> str:
+        pass
 
 
 class SelectorDistanceArgument(SelectorArgument):
@@ -1946,8 +2419,9 @@ class SelectorDistanceArgument(SelectorArgument):
     def name(self) -> str:
         return "distance"
 
+    @property
     @override
-    def __str__(self) -> str:
+    def value_str(self) -> str:
         return str(self.distance)
 
     @property
@@ -1975,8 +2449,9 @@ class SelectorTagArgument(SelectorArgumentReversible):
     def name(self) -> str:
         return "tag"
 
+    @property
     @override
-    def __str__(self) -> str:
+    def value_str_without_reverse(self) -> str:
         return f"{self.tag}"
 
     @property
@@ -2008,6 +2483,7 @@ class SelectorScoresArgument(SelectorArgument):
         for objective, range in self.scores.items():
             if isinstance(range, IntRange | IntType):
                 result |= range.macro_arguments
+                result |= objective.macro_arguments
         return result
 
     @property
@@ -2015,53 +2491,76 @@ class SelectorScoresArgument(SelectorArgument):
     def name(self) -> str:
         return "scores"
 
+    @property
     @override
-    def __str__(self) -> str:
+    def value_str(self) -> str:
         return "{" + ",".join(f"{objective}={range}" for objective, range in self.scores.items()) + "}"
+
+
+class SelectorNameArgument(SelectorArgumentReversible):
+    """选择器name参数"""
+
+    value: StringLike
+
+    def __init__(self, value: StringLike):
+        super().__init__()
+        self.value = value
+
+    @property
+    @override
+    def is_dynamic(self) -> bool:
+        if isinstance(self.value, Argument):
+            if self.value.is_dynamic:
+                return True
+        return False
+
+    @property
+    @override
+    def macro_arguments(self) -> set[MacroArgument]:
+        if isinstance(self.value, Argument):
+            return self.value.macro_arguments
+        return set()
+
+    @property
+    @override
+    def name(self) -> str:
+        return "name"
+
+    @property
+    @override
+    def value_str_without_reverse(self) -> str:
+        return str(self.value)
 
 
 class Selector(Argument):
     """命令选择器"""
+    var: SelectorVariable = SelectorVariable.ALL
 
-    def __init__(self, var: SelectorVariable, *args: SelectorArgument):
+    def __init__(self, *args: SelectorArgument):
         super().__init__()
-        self.var: SelectorVariable = var
         self.arguments: tuple[SelectorArgument, ...] = args
 
-    @classmethod
-    def self(cls) -> Selector:
-        return cls(SelectorVariable.SELF)
-
-    @classmethod
-    def all(cls) -> Selector:
-        return cls(SelectorVariable.ALL)
-
-    @classmethod
-    def players(cls) -> Selector:
-        return cls(SelectorVariable.PLAYERS)
-
-    @classmethod
-    def nearest_player(cls) -> Selector:
-        return cls(SelectorVariable.NEAREST_PLAYER)
-
     def distance(self, distance: Range):
-        return type(self)(self.var, *self.arguments, SelectorDistanceArgument(distance))
+        return type(self)(*self.arguments, SelectorDistanceArgument(distance))
 
     def tag(self, tag: Tag, reverse: bool = False):
-        return type(self)(self.var, *self.arguments, SelectorTagArgument(tag, reverse))
+        return type(self)(*self.arguments, SelectorTagArgument(tag, reverse))
 
     def scores(self, scores: dict[Objective, IntLike | IntRange]):
-        return type(self)(self.var, *self.arguments, SelectorScoresArgument(scores))
+        return type(self)(*self.arguments, SelectorScoresArgument(scores))
+
+    def name(self, name: StringLike):
+        return type(self)(*self.arguments, SelectorNameArgument(name))
 
     @override
     def __str__(self) -> str:
         if len(self.arguments) == 0:
             return f"@{self.var.value}"
-        return f"@{self.var.value}[{','.join(f"{arg.name}={str(arg)}" for arg in self.arguments)}]"
+        return f"@{self.var.value}[{','.join(f"{arg.name}={arg.value_str}" for arg in self.arguments)}]"
 
     @override
     def __repr__(self) -> str:
-        return f"Selector({self.var.name})"
+        return f"{type(self).__name__}({self.arguments})"
 
     @property
     @override
@@ -2078,6 +2577,48 @@ class Selector(Argument):
         for arg in self.arguments:
             result |= arg.macro_arguments
         return result
+
+    @override
+    def __eq__(self, other: object):
+        if not isinstance(other, Selector):
+            return False
+        return self.var == other.var and self.arguments == other.arguments
+
+    @override
+    def __hash__(self):
+        return hash((self.var, self.arguments))
+
+
+class SingleSelector(Selector):
+    """单个选择器"""
+    var: SelectorVariable = SelectorVariable.NEAREST
+
+
+class PlayerSelector(Selector):
+    """玩家选择器"""
+    var: SelectorVariable = SelectorVariable.PLAYERS
+
+
+class SinglePlayerSelector(SingleSelector, PlayerSelector):
+    """单个玩家选择器"""
+    var: SelectorVariable = SelectorVariable.NEAREST_PLAYER
+
+    @override
+    def __str__(self) -> str:
+        if len(self.arguments) == 1:
+            arg = self.arguments[0]
+            if isinstance(arg, SelectorNameArgument) and not arg.reverse:
+                return self.arguments[0].value_str
+        return super().__str__()
+
+    @classmethod
+    def from_name(cls, name: str):
+        return cls().name(name)
+
+
+class SelfSelector(SinglePlayerSelector):
+    """自身选择器"""
+    var: SelectorVariable = SelectorVariable.SELF
 
 
 class ScoreboardCriteria(Argument, ABC):
@@ -2140,14 +2681,14 @@ class Objective(Argument, Creatable):
     def __init__(self, objective: StringLike, criteria: ScoreboardCriteria | None = None):
         super().__init__()
         self.name = objective
-        self.criteria = criteria or PREDEFINED_SCOREBOARD_CRITERIA["dummy"]
+        self.criteria = criteria or SCOREBOARD_CRITERIA["dummy"]
         Registries.OBJECTIVE_REGISTRY.register_objective(self)
 
     def __getitem__(self, name: str | Selector) -> "Score":
         return Score(self, name)
 
     def self(self):
-        return self[Selector.self()]
+        return self[SelfSelector()]
 
     @override
     def __str__(self):
@@ -2432,7 +2973,7 @@ class IntMacroArgument(IntType, NbtIntType, NumericMacroArgument):
 
 class ForContext:
 
-    def __init__(self, function: Function, num: IntLike | Score, end: IntLike | Score | None = None, step: IntLike | Score = 1, path: tuple[str, ...] = (), macro_argument: MacroArgument | None = None):
+    def __init__(self, function: Function, num: IntLike | Score, end: IntLike | Score | None = None, step: IntLike | Score = 1, path: tuple[str, ...] = (), macro_argument: MacroArgument | None = None, doc: str | FunctionDoc | None = None):
         if end is None:
             end = num
             num = 0
@@ -2447,22 +2988,31 @@ class ForContext:
         self.scb: Objective = self.function.local_scb()
         self.index: Score = self.scb["__for_loop_index"]
         self.total: Score = self.scb["__for_loop_total"]
+        self.doc: str | FunctionDoc | None = doc
 
     def __enter__(self):
+        self.function.comment("设置循环总次数")
         self.function.set(self.total, self.end)
+        self.function.comment("初始化循环索引")
         self.function.set(self.index, self.start)
         if self.macro_argument is not None:
+            self.function.comment("将当前索引存入 storage，用于宏参数")
             self.function.store("result", self.macro_argument).get(self.index)
-        self.sub_function = self.function.sub_function(*self.path).__enter__()
+        self.function.comment("开始循环")
+        self.sub_function = self.function.sub_function(*self.path, doc=self.doc).__enter__()
+        self.sub_function.comment("如果循环索引已达到总次数，则结束循环")
         self.sub_function.if_(self.index >= self.total).return_fail()
         return self.sub_function
 
     def __exit__(self, exc_type: type, exc_val: BaseException, exc_tb: TracebackType):
         if self.sub_function is not None:
+            self.sub_function.comment("更新循环索引")
             self.sub_function.add(self.index, self.step)
             if self.macro_argument is not None:
+                self.sub_function.comment("更新 storage 中的索引")
                 self.sub_function.store("result", self.macro_argument).get(self.index)
-                self.sub_function.call_function(self.sub_function)
+            self.sub_function.comment("递归调用自身继续循环")
+            self.sub_function.call_function(self.sub_function)
             self.sub_function.__exit__(exc_type, exc_val, exc_tb)
 
 
@@ -2477,21 +3027,26 @@ class Config:
 
 
 # 预定义的方块和物品类型
-PREDEFINED_BLOCK_TYPES: dict[str, BlockType] = {
+BLOCKS: dict[str, BlockType] = {
     "air": BlockType.with_minecraft_namespace("air"),
     "stone": BlockType.with_minecraft_namespace("stone"),
     "dirt": BlockType.with_minecraft_namespace("dirt"),
     "grass_block": BlockType.with_minecraft_namespace("grass_block"),
 }
 
-PREDEFINED_ITEM_TYPES: dict[str, ItemType] = {
+ITEMS: dict[str, ItemType] = {
     "stone_sword": ItemType.with_minecraft_namespace("stone_sword"),
     "stone_pickaxe": ItemType.with_minecraft_namespace("stone_pickaxe"),
     "stone_axe": ItemType.with_minecraft_namespace("stone_axe"),
 }
 
-PREDEFINED_SCOREBOARD_CRITERIA: dict[str, ScoreboardCriteria] = {
+SCOREBOARD_CRITERIA: dict[str, ScoreboardCriteria] = {
     "dummy": ScoreboardSingleCriteria("dummy"),
+}
+
+ANCHORS: dict[str, Anchor] = {
+    "eyes": Anchor("eyes"),
+    "feet": Anchor("feet"),
 }
 
 PREDEFINED_TEXT_COLORS: dict[str, TextColor] = {
